@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+fontdb = "0.23"
 fontdue = "0.9"
 gl = "0.14"
 glfw = "0.58"

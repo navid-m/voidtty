@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod font;
 mod input;
 mod renderer;
 mod terminal;
@@ -18,7 +19,8 @@ const FALLBACK_FONT: &[u8] = include_bytes!("../assets/font.ttf");
 fn main() -> Result<()> {
     let config = Config::load()?;
 
-    let font_data = load_font();
+    let font = load_font(&config);
+    eprintln!("godtty: using font \"{}\"", font.family);
 
     let mut glfw = glfw::init(glfw::fail_on_errors).context("initialising GLFW")?;
 
@@ -48,8 +50,14 @@ fn main() -> Result<()> {
     gl::load_with(|s| window.get_proc_address(s));
 
     let (fw, fh) = window.get_framebuffer_size();
-    let mut renderer = Renderer::new(&font_data, config.font_size, fw as u32, fh as u32)
-        .context("initialising renderer")?;
+    let mut renderer = Renderer::new(
+        &font.data,
+        font.face_index,
+        config.font_size,
+        fw as u32,
+        fh as u32,
+    )
+    .context("initialising renderer")?;
 
     let mut app = App::new(config)?;
 
@@ -195,11 +203,19 @@ fn resize_ptys(app: &mut App, renderer: &Renderer) {
     }
 }
 
-fn load_font() -> Vec<u8> {
+fn load_font(config: &Config) -> font::LoadedFont {
     if let Ok(path) = std::env::var("GODTTY_FONT") {
-        if let Ok(bytes) = std::fs::read(&path) {
-            return bytes;
+        if let Ok(data) = std::fs::read(&path) {
+            return font::LoadedFont {
+                data,
+                face_index: 0,
+                family: path,
+            };
         }
     }
-    FALLBACK_FONT.to_vec()
+    font::load(&config.font_family).unwrap_or_else(|| font::LoadedFont {
+        data: FALLBACK_FONT.to_vec(),
+        face_index: 0,
+        family: "bundled fallback".into(),
+    })
 }

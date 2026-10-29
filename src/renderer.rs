@@ -31,8 +31,12 @@ pub struct GlyphAtlas {
 
 impl GlyphAtlas {
     /// Rasterises printable ASCII into a single R8 OpenGL texture.
-    pub fn build(font_data: &[u8], font_size: f32) -> Result<Self> {
-        let font = Font::from_bytes(font_data, FontSettings::default())
+    pub fn build(font_data: &[u8], face_index: u32, font_size: f32) -> Result<Self> {
+        let settings = FontSettings {
+            collection_index: face_index,
+            ..FontSettings::default()
+        };
+        let font = Font::from_bytes(font_data, settings)
             .map_err(|e| anyhow::anyhow!("fontdue: {e}"))?;
 
         let chars: Vec<char> = (0x20u8..=0x7eu8).map(|b| b as char).collect();
@@ -44,12 +48,23 @@ impl GlyphAtlas {
             max_w = max_w.max(m.width as u32 + 2);
             max_h = max_h.max(m.height as u32 + 2);
         }
-        let cell_w = max_w.max(1);
+
+        // Cell width is the advance of a regular glyph, not the widest bitmap:
+        // for monospaced fonts this keeps PTY columns aligned with drawn text.
+        let advance = font.rasterize('M', font_size).0.advance_width;
+        let cell_w = if advance.is_finite() && advance > 0.0 {
+            advance.ceil() as u32
+        } else {
+            max_w
+        }
+        .max(1);
+        // Atlas slots must still fit glyphs that overhang their advance.
+        let slot_w = cell_w.max(max_w);
         let cell_h = max_h.max(1);
 
         let cols: u32 = 16;
         let rows = (chars.len() as u32 + cols - 1) / cols;
-        let atlas_w = cols * cell_w;
+        let atlas_w = cols * slot_w;
         let atlas_h = rows * cell_h;
 
         let mut pixels = vec![0u8; (atlas_w * atlas_h) as usize];
@@ -63,7 +78,7 @@ impl GlyphAtlas {
             let (m, bitmap) = font.rasterize(c, font_size);
             let col = i as u32 % cols;
             let row = i as u32 / cols;
-            let ox  = col * cell_w;
+            let ox  = col * slot_w;
             let oy  = row * cell_h;
 
             for y in 0..m.height {
@@ -233,8 +248,14 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(font_data: &[u8], font_size: f32, win_w: u32, win_h: u32) -> Result<Self> {
-        let atlas = GlyphAtlas::build(font_data, font_size)
+    pub fn new(
+        font_data: &[u8],
+        face_index: u32,
+        font_size: f32,
+        win_w: u32,
+        win_h: u32,
+    ) -> Result<Self> {
+        let atlas = GlyphAtlas::build(font_data, face_index, font_size)
             .context("building glyph atlas")?;
 
         let prog_text = link_program(

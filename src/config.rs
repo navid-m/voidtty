@@ -8,6 +8,8 @@ pub struct Config {
     pub opacity: f32,
     /// Shell to spawn in each pane.
     pub shell: String,
+    /// Comma-separated preferred font families; empty means auto-select.
+    pub font_family: String,
     /// Font size in points.
     pub font_size: f32,
     /// Scrollback buffer lines per pane.
@@ -23,6 +25,7 @@ impl Default for Config {
         Self {
             opacity: 0.90,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            font_family: String::new(),
             font_size: 16.0,
             scrollback: 10_000,
             win_width: 1280,
@@ -67,6 +70,7 @@ impl Config {
             match key {
                 "opacity"     => { if let Ok(v) = val.parse::<f32>()  { cfg.opacity    = v.clamp(0.0, 1.0); } }
                 "shell"       => { cfg.shell = val.to_owned(); }
+                "font_family" => { cfg.font_family = val.to_owned(); }
                 "font_size"   => { if let Ok(v) = val.parse::<f32>()  { cfg.font_size  = v; } }
                 "scrollback"  => { if let Ok(v) = val.parse::<usize>() { cfg.scrollback = v; } }
                 "win_width"   => { if let Ok(v) = val.parse::<u32>()  { cfg.win_width  = v; } }
@@ -83,11 +87,14 @@ impl Config {
              ; Window opacity: 0.0 (transparent) to 1.0 (opaque)\n\
              opacity = {:.2}\n\
              shell = {}\n\
+             ; Preferred font families (comma-separated). Empty auto-selects a\n\
+             ; monospace system font, preferring ligature fonts such as Fira Code.\n\
+             font_family = {}\n\
              font_size = {:.1}\n\
              scrollback = {}\n\
              win_width = {}\n\
              win_height = {}\n",
-            self.opacity, self.shell, self.font_size,
+            self.opacity, self.shell, self.font_family, self.font_size,
             self.scrollback, self.win_width, self.win_height,
         )
     }
