@@ -12,6 +12,7 @@ use glfw::{Context as _, GlfwReceiver, OpenGlProfileHint, WindowEvent, WindowHin
 use app::App;
 use config::Config;
 use renderer::Renderer;
+use terminal::{Color, Style};
 use ui::{
     PANE_PAD, TAB_BAR_H, TAB_BAR_PAD, TAB_INDICATOR_GAP, TAB_INDICATOR_RADIUS,
     TAB_INDICATOR_SIZE, pane_rects, text_cols, text_rows,
@@ -70,11 +71,15 @@ fn main() -> Result<()> {
     while !window.should_close() && app.running {
         glfw.poll_events();
         process_events(&events, &mut window, &mut app, &mut renderer)?;
+        app.reap_exited_panes();
+        if !app.running {
+            break;
+        }
         if (renderer.font_size - app.config.font_size).abs() > f32::EPSILON {
             renderer.set_font_size(app.config.font_size)?;
             resize_ptys(&mut app, &renderer);
         }
-        draw_frame(&renderer, &app);
+        draw_frame(&mut renderer, &app)?;
         window.swap_buffers();
     }
 
@@ -129,10 +134,68 @@ fn tab_color(accent: usize, active: bool) -> (f32, f32, f32) {
     ((r * k).min(1.0), (g * k).min(1.0), (b * k).min(1.0))
 }
 
-fn draw_frame(renderer: &Renderer, app: &App) {
+const DEFAULT_FG: (f32, f32, f32) = (0.90, 0.90, 0.90);
+const DEFAULT_BG: (f32, f32, f32) = (0.0, 0.0, 0.0);
+
+const ANSI_COLORS: [[f32; 3]; 16] = [
+    [0.00, 0.00, 0.00], [0.80, 0.25, 0.25], [0.35, 0.70, 0.35], [0.80, 0.70, 0.30],
+    [0.30, 0.50, 0.90], [0.70, 0.40, 0.85], [0.30, 0.70, 0.80], [0.80, 0.80, 0.80],
+    [0.45, 0.45, 0.50], [1.00, 0.45, 0.45], [0.55, 0.95, 0.55], [1.00, 0.90, 0.45],
+    [0.50, 0.70, 1.00], [0.90, 0.60, 1.00], [0.50, 0.90, 0.95], [1.00, 1.00, 1.00],
+];
+
+fn indexed_color(index: u8) -> (f32, f32, f32) {
+    match index {
+        0..=15 => {
+            let c = ANSI_COLORS[index as usize];
+            (c[0], c[1], c[2])
+        }
+        16..=231 => {
+            let i = index - 16;
+            let levels = [0.0, 95.0, 135.0, 175.0, 215.0, 255.0];
+            let r = levels[(i / 36) as usize] / 255.0;
+            let g = levels[((i % 36) / 6) as usize] / 255.0;
+            let b = levels[(i % 6) as usize] / 255.0;
+            (r, g, b)
+        }
+        _ => {
+            let v = (8 + (index - 232) * 10) as f32 / 255.0;
+            (v, v, v)
+        }
+    }
+}
+
+fn color_rgb(color: Color, bold: bool) -> Option<(f32, f32, f32)> {
+    let c = match color {
+        Color::Default => return None,
+        Color::Indexed(n) => indexed_color(n),
+        Color::Rgb(r, g, b) => (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
+    };
+    if bold {
+        Some(((c.0 * 1.15).min(1.0), (c.1 * 1.15).min(1.0), (c.2 * 1.15).min(1.0)))
+    } else {
+        Some(c)
+    }
+}
+
+/// Resolves a cell style into (foreground, background, needs_background_fill).
+fn cell_colors(style: Style) -> ((f32, f32, f32), (f32, f32, f32), bool) {
+    let mut fg = color_rgb(style.fg, style.bold).unwrap_or(DEFAULT_FG);
+    let mut bg = color_rgb(style.bg, false).unwrap_or(DEFAULT_BG);
+    if style.bold && style.fg == Color::Default {
+        fg = (1.0, 1.0, 1.0);
+    }
+    if style.reverse {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    let fill = style.reverse || style.bg != Color::Default;
+    (fg, bg, fill)
+}
+
+fn draw_frame(renderer: &mut Renderer, app: &App) -> Result<()> {
     let opacity = app.config.opacity;
-    // Dark background respecting transparency.
-    renderer.clear(0.07, 0.07, 0.10, opacity);
+    // Black background respecting transparency.
+    renderer.clear(0.0, 0.0, 0.0, opacity);
 
     let tab = app.active_tab();
     let rects = pane_rects(renderer.win_w, renderer.win_h, tab.panes.len());
@@ -198,7 +261,7 @@ fn draw_frame(renderer: &Renderer, app: &App) {
         let focused = i == tab.focused;
 
         // Pane background.
-        renderer.draw_rect(rect.x, rect.y, rect.w, rect.h, 0.05, 0.05, 0.08, opacity);
+        renderer.draw_rect(rect.x, rect.y, rect.w, rect.h, 0.0, 0.0, 0.0, opacity);
 
         // Border highlight for focused pane.
         if focused {
@@ -214,15 +277,42 @@ fn draw_frame(renderer: &Renderer, app: &App) {
             renderer.draw_rect(rect.x, rect.y, t, rect.h, c, c, c, 0.6);
         }
 
-        // Terminal text.
+        // Terminal cells: backgrounds first, then shaped text with per-cell color.
         let screen = pane.pty.screen.lock().unwrap();
-        let lines = screen.visible_lines();
+        let rows = screen.visible_cells();
+        let cw = renderer.cell_w();
+        let lh = renderer.line_height();
 
-        for (row, line) in lines.iter().enumerate() {
-            let y = rect.y + PANE_PAD + row as f32 * renderer.line_height();
-            renderer.draw_text(line, rect.x + PANE_PAD, y, 0.9, 0.9, 0.9, 1.0);
+        for (row, cells) in rows.iter().enumerate() {
+            let y = rect.y + PANE_PAD + row as f32 * lh;
+            let last = cells
+                .iter()
+                .rposition(|c| c.ch != ' ' || c.style != Style::default())
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            if last == 0 {
+                continue;
+            }
+
+            let mut colors = Vec::with_capacity(last);
+            for (col, cell) in cells[..last].iter().enumerate() {
+                let (fg, bg, fill) = cell_colors(cell.style);
+                let x = rect.x + PANE_PAD + col as f32 * cw;
+                if fill {
+                    renderer.draw_rect(x, y, cw, lh, bg.0, bg.1, bg.2, opacity);
+                }
+                if cell.style.underline {
+                    renderer.draw_rect(x, y + lh - 1.5, cw, 1.0, fg.0, fg.1, fg.2, opacity);
+                }
+                colors.push(fg);
+            }
+
+            let text: String = cells[..last].iter().map(|c| c.ch).collect();
+            renderer.draw_text_styled(&text, &colors, rect.x + PANE_PAD, y, 1.0)?;
         }
     }
+
+    Ok(())
 }
 
 /// Recalculates PTY cols/rows after a resize event.

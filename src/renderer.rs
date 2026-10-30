@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use fontdue::{Font, FontSettings};
 use gl::types::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 
 // ── Glyph atlas ───────────────────────────────────────────────────────────────
@@ -15,23 +15,71 @@ pub struct GlyphMetrics {
     pub xoff: f32,
     /// Vertical offset from baseline to bitmap top edge.
     pub yoff: f32,
-    pub advance: f32,
 }
 
 pub struct GlyphAtlas {
     pub texture:     GLuint,
-    pub atlas_w:     u32,
-    pub atlas_h:     u32,
     pub cell_w:      f32,
-    pub cell_h:      f32,
     pub line_height: f32,
     pub ascent:      f32,
-    glyphs: HashMap<char, GlyphMetrics>,
+    glyphs: HashMap<u16, GlyphMetrics>,
+}
+
+/// One positioned glyph produced by the shaper.
+#[derive(Clone, Copy)]
+struct ShapedGlyph {
+    glyph_id: u16,
+    cluster: u32,
+    x_offset: f32,
+    y_offset: f32,
+}
+
+/// Shapes `text` with HarfBuzz-compatible shaping (ligatures enabled), scaling
+/// positions from font units into pixels.
+fn shape_text(font_data: &[u8], face_index: u32, font_size: f32, text: &str) -> Vec<ShapedGlyph> {
+    let Some(face) = rustybuzz::Face::from_slice(font_data, face_index) else {
+        return Vec::new();
+    };
+    let units = face.units_per_em() as f32;
+    let scale = if units > 0.0 { font_size / units } else { 1.0 };
+
+    // Ensure programming ligatures are active regardless of the font's
+    // default feature set (some fonts put them behind `calt`/`clig`).
+    let tag = |b: &[u8; 4]| rustybuzz::ttf_parser::Tag::from_bytes(b);
+    let features = [
+        rustybuzz::Feature::new(tag(b"liga"), 1, ..),
+        rustybuzz::Feature::new(tag(b"clig"), 1, ..),
+        rustybuzz::Feature::new(tag(b"calt"), 1, ..),
+    ];
+
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    buffer.guess_segment_properties();
+    let shaped = rustybuzz::shape(&face, &features, buffer);
+
+    shaped
+        .glyph_infos()
+        .iter()
+        .zip(shaped.glyph_positions())
+        .filter_map(|(info, pos)| {
+            Some(ShapedGlyph {
+                glyph_id: u16::try_from(info.glyph_id).ok()?,
+                cluster: info.cluster,
+                x_offset: pos.x_offset as f32 * scale,
+                y_offset: pos.y_offset as f32 * scale,
+            })
+        })
+        .collect()
 }
 
 impl GlyphAtlas {
-    /// Rasterises printable ASCII into a single R8 OpenGL texture.
-    pub fn build(font_data: &[u8], face_index: u32, font_size: f32) -> Result<Self> {
+    /// Rasterises the given glyph ids into a single R8 OpenGL texture.
+    pub fn build(
+        font_data: &[u8],
+        face_index: u32,
+        font_size: f32,
+        glyph_ids: &[u16],
+    ) -> Result<Self> {
         let settings = FontSettings {
             collection_index: face_index,
             ..FontSettings::default()
@@ -39,12 +87,18 @@ impl GlyphAtlas {
         let font = Font::from_bytes(font_data, settings)
             .map_err(|e| anyhow::anyhow!("fontdue: {e}"))?;
 
-        let chars: Vec<char> = (0x20u8..=0x7eu8).map(|b| b as char).collect();
+        let glyph_count = font.glyph_count();
+        let glyph_ids: Vec<u16> = glyph_ids
+            .iter()
+            .copied()
+            .filter(|&id| id < glyph_count)
+            .collect();
+        let glyph_ids = glyph_ids.as_slice();
 
         let mut max_w = 0u32;
         let mut max_h = 0u32;
-        for &c in &chars {
-            let (m, _) = font.rasterize(c, font_size);
+        for &id in glyph_ids {
+            let (m, _) = font.rasterize_indexed(id, font_size);
             max_w = max_w.max(m.width as u32 + 2);
             max_h = max_h.max(m.height as u32 + 2);
         }
@@ -63,19 +117,19 @@ impl GlyphAtlas {
         let cell_h = max_h.max(1);
 
         let cols: u32 = 16;
-        let rows = (chars.len() as u32 + cols - 1) / cols;
-        let atlas_w = cols * slot_w;
-        let atlas_h = rows * cell_h;
+        let rows = (glyph_ids.len() as u32 + cols - 1) / cols;
+        let atlas_w = (cols * slot_w).max(1);
+        let atlas_h = (rows * cell_h).max(1);
 
         let mut pixels = vec![0u8; (atlas_w * atlas_h) as usize];
-        let mut glyphs: HashMap<char, GlyphMetrics> = HashMap::new();
+        let mut glyphs: HashMap<u16, GlyphMetrics> = HashMap::new();
 
         // Use 'M' to measure ascent (distance from baseline to top of caps).
         let (ref_m, _) = font.rasterize('M', font_size);
         let ascent = ref_m.height as f32;
 
-        for (i, &c) in chars.iter().enumerate() {
-            let (m, bitmap) = font.rasterize(c, font_size);
+        for (i, &id) in glyph_ids.iter().enumerate() {
+            let (m, bitmap) = font.rasterize_indexed(id, font_size);
             let col = i as u32 % cols;
             let row = i as u32 / cols;
             let ox  = col * slot_w;
@@ -88,7 +142,7 @@ impl GlyphAtlas {
                 }
             }
 
-            glyphs.insert(c, GlyphMetrics {
+            glyphs.insert(id, GlyphMetrics {
                 u0: ox as f32 / atlas_w as f32,
                 v0: oy as f32 / atlas_h as f32,
                 u1: (ox + m.width as u32)  as f32 / atlas_w as f32,
@@ -97,7 +151,6 @@ impl GlyphAtlas {
                 bh: m.height as f32,
                 xoff: m.xmin as f32,
                 yoff: m.ymin as f32,
-                advance: m.advance_width,
             });
         }
 
@@ -119,17 +172,16 @@ impl GlyphAtlas {
         }
 
         Ok(Self {
-            texture, atlas_w, atlas_h,
+            texture,
             cell_w: cell_w as f32,
-            cell_h: cell_h as f32,
             line_height: cell_h as f32,
             ascent,
             glyphs,
         })
     }
 
-    pub fn get(&self, c: char) -> Option<&GlyphMetrics> {
-        self.glyphs.get(&c)
+    pub fn get(&self, id: u16) -> Option<&GlyphMetrics> {
+        self.glyphs.get(&id)
     }
 }
 
@@ -290,6 +342,11 @@ pub struct Renderer {
     pub font_size: f32,
     font_data: Vec<u8>,
     face_index: u32,
+    glyph_ids: HashSet<u16>,
+}
+
+fn ascii_sample() -> String {
+    (0x20u8..=0x7e).map(char::from).collect()
 }
 
 impl Renderer {
@@ -300,7 +357,13 @@ impl Renderer {
         win_w: u32,
         win_h: u32,
     ) -> Result<Self> {
-        let atlas = GlyphAtlas::build(font_data, face_index, font_size)
+        let glyph_ids: HashSet<u16> = shape_text(font_data, face_index, font_size, &ascii_sample())
+            .into_iter()
+            .map(|g| g.glyph_id)
+            .collect();
+        let mut initial: Vec<u16> = glyph_ids.iter().copied().collect();
+        initial.sort_unstable();
+        let atlas = GlyphAtlas::build(font_data, face_index, font_size, &initial)
             .context("building glyph atlas")?;
 
         let prog_text = link_program(
@@ -343,7 +406,18 @@ impl Renderer {
             font_size,
             font_data: font_data.to_vec(),
             face_index,
+            glyph_ids,
         })
+    }
+
+    fn rebuild_atlas(&mut self) -> Result<()> {
+        let mut ids: Vec<u16> = self.glyph_ids.iter().copied().collect();
+        ids.sort_unstable();
+        let atlas = GlyphAtlas::build(&self.font_data, self.face_index, self.font_size, &ids)
+            .context("rebuilding glyph atlas")?;
+        let old = std::mem::replace(&mut self.atlas, atlas);
+        unsafe { gl::DeleteTextures(1, &old.texture); }
+        Ok(())
     }
 
     /// Rebuilds the glyph atlas at a new size, replacing the old texture.
@@ -351,12 +425,8 @@ impl Renderer {
         if (size - self.font_size).abs() < f32::EPSILON {
             return Ok(());
         }
-        let atlas = GlyphAtlas::build(&self.font_data, self.face_index, size)
-            .context("rebuilding glyph atlas")?;
-        let old = std::mem::replace(&mut self.atlas, atlas);
         self.font_size = size;
-        unsafe { gl::DeleteTextures(1, &old.texture); }
-        Ok(())
+        self.rebuild_atlas()
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -414,21 +484,53 @@ impl Renderer {
         }
     }
 
-    /// Draws `text` with the top-left of the first cell at `(px, py)`.
-    pub fn draw_text(&self, text: &str, px: f32, py: f32, r: f32, g: f32, b: f32, a: f32) {
-        let mut verts: Vec<TV> = Vec::with_capacity(text.len() * 6);
-        let mut pen_x = px;
+    /// Draws shaped text with one color per terminal cell. Ligatures are
+    /// formed by the shaper and placed at the cell of their starting cluster.
+    pub fn draw_text_styled(
+        &mut self,
+        text: &str,
+        colors: &[(f32, f32, f32)],
+        px: f32,
+        py: f32,
+        alpha: f32,
+    ) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let shaped = shape_text(&self.font_data, self.face_index, self.font_size, text);
+        let mut changed = false;
+        for g in &shaped {
+            if self.glyph_ids.insert(g.glyph_id) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild_atlas()?;
+        }
+
+        // Map byte offsets (HarfBuzz clusters) to terminal cell indices.
+        let mut byte_to_cell: Vec<(u32, usize)> = Vec::new();
+        for (cell_idx, (byte, _)) in text.char_indices().enumerate() {
+            byte_to_cell.push((byte as u32, cell_idx));
+        }
+        let fallback = colors.first().copied().unwrap_or((0.9, 0.9, 0.9));
+
         let baseline = py + self.atlas.ascent;
+        let cell_w = self.atlas.cell_w;
+        let mut verts: Vec<TV> = Vec::with_capacity(shaped.len() * 6);
 
-        for c in text.chars() {
-            let ch = if c >= ' ' && c <= '~' { c } else { ' ' };
-            let Some(gm) = self.atlas.get(ch) else {
-                pen_x += self.atlas.cell_w;
-                continue;
+        for sg in &shaped {
+            let cell_idx = match byte_to_cell.binary_search_by_key(&sg.cluster, |&(b, _)| b) {
+                Ok(i) => byte_to_cell[i].1,
+                Err(0) => 0,
+                Err(i) => byte_to_cell[i - 1].1,
             };
+            let Some(gm) = self.atlas.get(sg.glyph_id) else { continue };
+            let (r, g, b) = colors.get(cell_idx).copied().unwrap_or(fallback);
 
-            let x0 = pen_x + gm.xoff;
-            let y0 = baseline - gm.bh - gm.yoff;
+            let x0 = px + cell_idx as f32 * cell_w + sg.x_offset + gm.xoff;
+            let y0 = baseline - gm.bh - gm.yoff - sg.y_offset;
             let x1 = x0 + gm.bw;
             let y1 = y0 + gm.bh;
 
@@ -436,13 +538,13 @@ impl Renderer {
                 (x0, y0, gm.u0, gm.v0), (x1, y0, gm.u1, gm.v0), (x0, y1, gm.u0, gm.v1),
                 (x1, y0, gm.u1, gm.v0), (x1, y1, gm.u1, gm.v1), (x0, y1, gm.u0, gm.v1),
             ] {
-                verts.push(TV { x, y, u, v, r, g, b, a });
+                verts.push(TV { x, y, u, v, r, g, b, a: alpha });
             }
-
-            pen_x += gm.advance;
         }
 
-        if verts.is_empty() { return; }
+        if verts.is_empty() {
+            return Ok(());
+        }
 
         unsafe {
             gl::UseProgram(self.prog_text);
@@ -452,6 +554,7 @@ impl Renderer {
             gl::BindTexture(gl::TEXTURE_2D, self.atlas.texture);
             upload_and_draw(self.vao_text, self.vbo_text, &verts, verts.len() as i32);
         }
+        Ok(())
     }
 
     pub fn cell_w(&self)      -> f32 { self.atlas.cell_w }
@@ -505,3 +608,24 @@ unsafe fn uniform1f(prog: GLuint, name: &str, v: f32) { unsafe {
     let loc = gl::GetUniformLocation(prog, cname.as_ptr());
     gl::Uniform1f(loc, v);
 }}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shapes_common_ligatures_when_font_supports_them() {
+        let Some(font) = crate::font::load("Cascadia Code") else { return };
+        for (lig, a, b) in [("->", "-", ">"), ("=>", "=", ">"), ("!=", "!", "=")] {
+            let shaped = shape_text(&font.data, font.face_index, 18.0, lig);
+            let isolated: Vec<u16> = a
+                .chars()
+                .chain(b.chars())
+                .flat_map(|c| shape_text(&font.data, font.face_index, 18.0, &c.to_string()))
+                .map(|g| g.glyph_id)
+                .collect();
+            let ids: Vec<u16> = shaped.iter().map(|g| g.glyph_id).collect();
+            assert_ne!(ids, isolated, "expected {lig:?} to use ligature glyphs");
+        }
+    }
+}

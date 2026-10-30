@@ -44,6 +44,11 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
         }
     }
 
+    if ctrl && key == Key::W {
+        app.close_tab();
+        return Ok(true);
+    }
+
     let bytes: Vec<u8> = if ctrl {
         match key {
             Key::A  => vec![0x01], Key::B  => vec![0x02], Key::C  => vec![0x03],
@@ -53,7 +58,7 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
             Key::M  => vec![0x0d], Key::N  => vec![0x0e], Key::O  => vec![0x0f],
             Key::P  => vec![0x10], Key::Q  => vec![0x11], Key::R  => vec![0x12],
             Key::S  => vec![0x13], Key::T  => vec![0x14], Key::U  => vec![0x15],
-            Key::V  => vec![0x16], Key::W  => vec![0x17], Key::X  => vec![0x18],
+            Key::V  => vec![0x16], Key::X  => vec![0x18],
             Key::Y  => vec![0x19], Key::Z  => vec![0x1a],
             Key::LeftBracket  => vec![0x1b],
             Key::Backslash    => vec![0x1c],
@@ -77,7 +82,10 @@ pub fn handle_char(c: char, app: &mut App) -> Result<()> {
     app.active_tab_mut().focused_pane_mut().pty.write(s.as_bytes())
 }
 
-fn key_to_bytes(key: Key, _mods: Modifiers) -> Vec<u8> {
+fn key_to_bytes(key: Key, mods: Modifiers) -> Vec<u8> {
+    if key == Key::Tab && mods.contains(Modifiers::Shift) {
+        return b"\x1b[Z".to_vec();
+    }
     match key {
         Key::Enter     => b"\r".to_vec(),
         Key::Backspace => vec![0x7f],

@@ -7,15 +7,12 @@ use crate::{
 /// A single rectangular pane containing one PTY.
 pub struct Pane {
     pub pty: Pty,
-    /// Human-readable title (set from OSC 2 / shell $PWD in a later iteration).
-    pub title: String,
 }
 
 impl Pane {
     pub fn new(config: &Config) -> Result<Self> {
         Ok(Self {
             pty: Pty::spawn(&config.shell, 80, 24, config.scrollback)?,
-            title: config.shell.split('/').last().unwrap_or("shell").to_owned(),
         })
     }
 }
@@ -134,6 +131,54 @@ impl App {
             self.active_tab = self.active_tab.saturating_sub(1);
         } else {
             self.running = false;
+        }
+    }
+
+    /// Removes panes whose shells have exited, then closes empty tabs. If no
+    /// tabs remain the whole emulator is asked to shut down.
+    pub fn reap_exited_panes(&mut self) {
+        let mut i = 0;
+        while i < self.tabs.len() {
+            let empty = {
+                let tab = &mut self.tabs[i];
+                let mut j = tab.panes.len();
+                while j > 0 {
+                    j -= 1;
+                    if !tab.panes[j].pty.is_alive() {
+                        tab.panes.remove(j);
+                        if tab.focused > j {
+                            tab.focused -= 1;
+                        } else if tab.focused == j {
+                            tab.focused = tab.focused.saturating_sub(1);
+                        }
+                    }
+                }
+                if !tab.panes.is_empty() {
+                    tab.focused = tab.focused.min(tab.panes.len() - 1);
+                    tab.layout = match tab.panes.len() {
+                        1 => Layout::Single,
+                        2 => Layout::HSplit,
+                        _ => Layout::Grid,
+                    };
+                }
+                tab.panes.is_empty()
+            };
+
+            if empty {
+                self.tabs.remove(i);
+                if self.active_tab > i {
+                    self.active_tab -= 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        if self.tabs.is_empty() {
+            self.running = false;
+            self.active_tab = 0;
+        } else if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
         }
     }
 
