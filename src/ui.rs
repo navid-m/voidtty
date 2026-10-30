@@ -14,6 +14,19 @@ impl Rect {
 /// Height of the tab bar in pixels.
 pub const TAB_BAR_H: f32 = 28.0;
 
+/// Padding between a pane's border and its terminal text.
+pub const PANE_PAD: f32 = 6.0;
+
+/// Number of text columns that fit in a pane of the given width.
+pub fn text_cols(rect_w: f32, cell_w: f32) -> usize {
+    ((rect_w - PANE_PAD * 2.0).max(0.0) / cell_w).floor() as usize
+}
+
+/// Number of text rows that fit in a pane of the given height.
+pub fn text_rows(rect_h: f32, line_height: f32) -> usize {
+    ((rect_h - PANE_PAD * 2.0).max(0.0) / line_height).floor() as usize
+}
+
 /// Splits the content area (below the tab bar) into pane rects for the given
 /// number of panes. Supports 1, 2 (horizontal split), or 4 (2×2 grid).
 pub fn pane_rects(win_w: f32, win_h: f32, pane_count: usize) -> Vec<Rect> {

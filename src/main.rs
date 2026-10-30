@@ -12,7 +12,7 @@ use glfw::{Context as _, GlfwReceiver, OpenGlProfileHint, WindowEvent, WindowHin
 use app::App;
 use config::Config;
 use renderer::Renderer;
-use ui::{TAB_BAR_H, pane_rects};
+use ui::{PANE_PAD, TAB_BAR_H, pane_rects, text_cols, text_rows};
 
 const FALLBACK_FONT: &[u8] = include_bytes!("../assets/font.ttf");
 
@@ -60,6 +60,9 @@ fn main() -> Result<()> {
     .context("initialising renderer")?;
 
     let mut app = App::new(config)?;
+
+    // Size the PTY grids to the actual panes before the first frame.
+    resize_ptys(&mut app, &renderer);
 
     while !window.should_close() && app.running {
         glfw.poll_events();
@@ -179,13 +182,11 @@ fn draw_frame(renderer: &Renderer, app: &App) {
 
         // Terminal text.
         let screen = pane.pty.screen.lock().unwrap();
-        let pad = 6.0f32;
-        let rows = ((rect.h - pad * 2.0) / renderer.line_height()).floor() as usize;
-        let lines = screen.visible_lines(rows);
+        let lines = screen.visible_lines();
 
         for (row, line) in lines.iter().enumerate() {
-            let y = rect.y + pad + row as f32 * renderer.line_height();
-            renderer.draw_text(line, rect.x + pad, y, 0.9, 0.9, 0.9, 1.0);
+            let y = rect.y + PANE_PAD + row as f32 * renderer.line_height();
+            renderer.draw_text(line, rect.x + PANE_PAD, y, 0.9, 0.9, 0.9, 1.0);
         }
     }
 }
@@ -197,8 +198,8 @@ fn resize_ptys(app: &mut App, renderer: &Renderer) {
     let rects = pane_rects(renderer.win_w, renderer.win_h, app.active_tab().panes.len());
     let tab = app.active_tab_mut();
     for (pane, rect) in tab.panes.iter_mut().zip(rects.iter()) {
-        let cols = (rect.w / cw).floor() as u16;
-        let rows = (rect.h / lh).floor() as u16;
+        let cols = text_cols(rect.w, cw).max(1) as u16;
+        let rows = text_rows(rect.h, lh).max(1) as u16;
         let _ = pane.pty.resize(cols, rows);
     }
 }
