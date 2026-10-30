@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 use std::{fs, path::PathBuf};
 
-/// Application configuration loaded from ~/.godtty/settings.ini.
+/// Smallest font size the user can zoom out to, in points.
+pub const MIN_FONT_SIZE: f32 = 6.0;
+/// Largest font size the user can zoom in to, in points.
+pub const MAX_FONT_SIZE: f32 = 72.0;
+
+/// Application configuration loaded from ~/.voidtty/settings.ini.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Window opacity in [0.0, 1.0].
@@ -26,7 +31,7 @@ impl Default for Config {
             opacity: 0.90,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
             font_family: String::new(),
-            font_size: 16.0,
+            font_size: 18.0,
             scrollback: 10_000,
             win_width: 1280,
             win_height: 800,
@@ -37,7 +42,7 @@ impl Default for Config {
 impl Config {
     pub fn path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".godtty").join("settings.ini")
+        PathBuf::from(home).join(".voidtty").join("settings.ini")
     }
 
     /// Loads config from disk, creating the file with defaults if absent.
@@ -58,6 +63,17 @@ impl Config {
         Ok(Self::parse_ini(&raw))
     }
 
+    /// Writes the current configuration back to settings.ini.
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .with_context(|| format!("creating config dir {}", dir.display()))?;
+        }
+        fs::write(&path, self.to_ini())
+            .with_context(|| format!("writing config to {}", path.display()))
+    }
+
     fn parse_ini(src: &str) -> Self {
         let mut cfg = Self::default();
         for line in src.lines() {
@@ -71,7 +87,7 @@ impl Config {
                 "opacity"     => { if let Ok(v) = val.parse::<f32>()  { cfg.opacity    = v.clamp(0.0, 1.0); } }
                 "shell"       => { cfg.shell = val.to_owned(); }
                 "font_family" => { cfg.font_family = val.to_owned(); }
-                "font_size"   => { if let Ok(v) = val.parse::<f32>()  { cfg.font_size  = v; } }
+                "font_size"   => { if let Ok(v) = val.parse::<f32>()  { cfg.font_size  = v.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE); } }
                 "scrollback"  => { if let Ok(v) = val.parse::<usize>() { cfg.scrollback = v; } }
                 "win_width"   => { if let Ok(v) = val.parse::<u32>()  { cfg.win_width  = v; } }
                 "win_height"  => { if let Ok(v) = val.parse::<u32>()  { cfg.win_height = v; } }

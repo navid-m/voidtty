@@ -309,7 +309,7 @@ impl Perform for Performer {
     fn hook(&mut self, _: &Params, intermediates: &[u8], _: bool, action: char) {
         // Reply to XTVERSION so shells don't stall waiting for a terminal name.
         if action == 'q' && intermediates.contains(&b'>') {
-            self.respond(b"\x1bP>|godtty 0.1\x1b\\");
+            self.respond(b"\x1bP>|voidtty 0.1\x1b\\");
         }
     }
 
@@ -334,7 +334,7 @@ impl Perform for Performer {
             }
             'q' if intermediates.contains(&b'>') => {
                 // XTVERSION query: answer with a DCS name/version string.
-                self.respond(b"\x1bP>|godtty 0.1\x1b\\");
+                self.respond(b"\x1bP>|voidtty 0.1\x1b\\");
                 return;
             }
             'n' => {

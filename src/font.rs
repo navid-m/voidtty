@@ -1,6 +1,6 @@
 //! System font discovery.
 //!
-//! GodTTY prefers a monospaced font and, when several are installed, favours
+//! voidtty prefers a monospaced font and, when several are installed, favours
 //! programming fonts with ligatures (Fira Code, Cascadia Code, …). The bundled
 //! font is only used when no suitable system font can be found.
 

@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     let config = Config::load()?;
 
     let font = load_font(&config);
-    eprintln!("godtty: using font \"{}\"", font.family);
+    eprintln!("voidtty: using font \"{}\"", font.family);
 
     let mut glfw = glfw::init(glfw::fail_on_errors).context("initialising GLFW")?;
 
@@ -35,7 +35,7 @@ fn main() -> Result<()> {
         .create_window(
             config.win_width,
             config.win_height,
-            "GodTTY",
+            "voidtty",
             WindowMode::Windowed,
         )
         .context("creating GLFW window")?;
@@ -67,6 +67,10 @@ fn main() -> Result<()> {
     while !window.should_close() && app.running {
         glfw.poll_events();
         process_events(&events, &mut window, &mut app, &mut renderer)?;
+        if (renderer.font_size - app.config.font_size).abs() > f32::EPSILON {
+            renderer.set_font_size(app.config.font_size)?;
+            resize_ptys(&mut app, &renderer);
+        }
         draw_frame(&renderer, &app);
         window.swap_buffers();
     }
@@ -195,17 +199,18 @@ fn draw_frame(renderer: &Renderer, app: &App) {
 fn resize_ptys(app: &mut App, renderer: &Renderer) {
     let cw = renderer.cell_w();
     let lh = renderer.line_height();
-    let rects = pane_rects(renderer.win_w, renderer.win_h, app.active_tab().panes.len());
-    let tab = app.active_tab_mut();
-    for (pane, rect) in tab.panes.iter_mut().zip(rects.iter()) {
-        let cols = text_cols(rect.w, cw).max(1) as u16;
-        let rows = text_rows(rect.h, lh).max(1) as u16;
-        let _ = pane.pty.resize(cols, rows);
+    for tab in app.tabs.iter_mut() {
+        let rects = pane_rects(renderer.win_w, renderer.win_h, tab.panes.len());
+        for (pane, rect) in tab.panes.iter_mut().zip(rects.iter()) {
+            let cols = text_cols(rect.w, cw).max(1) as u16;
+            let rows = text_rows(rect.h, lh).max(1) as u16;
+            let _ = pane.pty.resize(cols, rows);
+        }
     }
 }
 
 fn load_font(config: &Config) -> font::LoadedFont {
-    if let Ok(path) = std::env::var("GODTTY_FONT") {
+    if let Ok(path) = std::env::var("voidtty_FONT") {
         if let Ok(data) = std::fs::read(&path) {
             return font::LoadedFont {
                 data,

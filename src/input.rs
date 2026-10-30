@@ -11,6 +11,21 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
     let ctrl_shift = mods.contains(Modifiers::Control | Modifiers::Shift);
     let ctrl       = mods.contains(Modifiers::Control) && !mods.contains(Modifiers::Shift);
 
+    // Ctrl + / Ctrl - (and numpad equivalents) zoom the text size.
+    if ctrl || ctrl_shift {
+        match key {
+            Key::Equal | Key::KpAdd => {
+                app.change_font_size(1.0)?;
+                return Ok(true);
+            }
+            Key::Minus | Key::KpSubtract => {
+                app.change_font_size(-1.0)?;
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+
     if ctrl_shift {
         match key {
             Key::T => { app.new_tab()?; return Ok(true); }

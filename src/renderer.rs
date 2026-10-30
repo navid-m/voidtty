@@ -245,6 +245,9 @@ pub struct Renderer {
     pub atlas: GlyphAtlas,
     pub win_w: f32,
     pub win_h: f32,
+    pub font_size: f32,
+    font_data: Vec<u8>,
+    face_index: u32,
 }
 
 impl Renderer {
@@ -287,7 +290,23 @@ impl Renderer {
             atlas,
             win_w: win_w as f32,
             win_h: win_h as f32,
+            font_size,
+            font_data: font_data.to_vec(),
+            face_index,
         })
+    }
+
+    /// Rebuilds the glyph atlas at a new size, replacing the old texture.
+    pub fn set_font_size(&mut self, size: f32) -> Result<()> {
+        if (size - self.font_size).abs() < f32::EPSILON {
+            return Ok(());
+        }
+        let atlas = GlyphAtlas::build(&self.font_data, self.face_index, size)
+            .context("rebuilding glyph atlas")?;
+        let old = std::mem::replace(&mut self.atlas, atlas);
+        self.font_size = size;
+        unsafe { gl::DeleteTextures(1, &old.texture); }
+        Ok(())
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {

@@ -1,5 +1,8 @@
 use anyhow::Result;
-use crate::{config::Config, terminal::Pty};
+use crate::{
+    config::{self, Config},
+    terminal::Pty,
+};
 
 /// A single rectangular pane containing one PTY.
 pub struct Pane {
@@ -132,5 +135,17 @@ impl App {
     pub fn prev_tab(&mut self) {
         let n = self.tabs.len();
         self.active_tab = (self.active_tab + n - 1) % n;
+    }
+
+    /// Adjusts the font size by `delta` points, clamping to the allowed range
+    /// and persisting the new value to settings.ini.
+    pub fn change_font_size(&mut self, delta: f32) -> Result<()> {
+        let size = (self.config.font_size + delta)
+            .clamp(config::MIN_FONT_SIZE, config::MAX_FONT_SIZE);
+        if (size - self.config.font_size).abs() < f32::EPSILON {
+            return Ok(());
+        }
+        self.config.font_size = size;
+        self.config.save()
     }
 }
