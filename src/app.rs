@@ -101,6 +101,17 @@ impl LayoutNode {
             }
         }
     }
+
+    /// Appends pane ids in visual/layout order (depth-first, left-to-right).
+    fn leaf_ids(&self, out: &mut Vec<usize>) {
+        match self {
+            LayoutNode::Leaf(id) => out.push(*id),
+            LayoutNode::Split { first, second, .. } => {
+                first.leaf_ids(out);
+                second.leaf_ids(out);
+            }
+        }
+    }
 }
 
 /// Removes a leaf, collapsing any split left with a single child. The returned
@@ -341,6 +352,33 @@ impl App {
         if let Some(pane) = self.pane_mut(self.focused) {
             pane.prev_tab();
         }
+    }
+
+    /// Focuses the next pane in layout order, wrapping around.
+    pub fn next_pane(&mut self) {
+        self.cycle_pane(1);
+    }
+
+    /// Focuses the previous pane in layout order, wrapping around.
+    pub fn prev_pane(&mut self) {
+        self.cycle_pane(-1);
+    }
+
+    fn cycle_pane(&mut self, step: isize) {
+        let Some(layout) = self.layout.as_ref() else {
+            return;
+        };
+        let mut order = Vec::new();
+        layout.leaf_ids(&mut order);
+        if order.len() <= 1 {
+            return;
+        }
+        let Some(index) = order.iter().position(|&id| id == self.focused) else {
+            self.focused = order[0];
+            return;
+        };
+        let len = order.len() as isize;
+        self.focused = order[(index as isize + step).rem_euclid(len) as usize];
     }
 
     /// Adjusts the font size by `delta` points, clamping to the allowed range

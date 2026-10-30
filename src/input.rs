@@ -34,6 +34,8 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
             Key::W => { app.close_tab(); return Ok(true); }
             Key::Right => { app.next_tab(); return Ok(true); }
             Key::Left  => { app.prev_tab(); return Ok(true); }
+            Key::LeftBracket  => { app.prev_pane(); return Ok(true); }
+            Key::RightBracket => { app.next_pane(); return Ok(true); }
             Key::X => { app.close_focused_pane(); return Ok(true); }
             Key::Tab => { app.prev_tab(); return Ok(true); }
             Key::Q => { app.running = false; return Ok(true); }
