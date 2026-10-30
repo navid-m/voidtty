@@ -10,6 +10,7 @@ Simple terminal emulator for personal use.
 ---
 
 <img src=".github/screenshots/main.png">
+<img src=".github/screenshots/screenshot2.png">
 
 ---
 
