@@ -115,18 +115,21 @@ impl GlyphAtlas {
         // Use the font's line metrics so glyphs sit correctly inside their cell
         // (important for full-height UI bars such as Neovim's statusline).
         let line_metrics = font.horizontal_line_metrics(font_size);
+        // Layout height must not depend on which glyphs happen to be in the
+        // atlas, otherwise printing new Unicode glyphs would shift the grid.
         let line_h = line_metrics
             .map(|m| m.new_line_size.ceil() as u32)
-            .unwrap_or(0);
+            .unwrap_or_else(|| (font_size * 1.2).ceil() as u32)
+            .max(1);
 
         // Atlas slots must still fit glyphs that overhang their advance.
         let slot_w = cell_w.max(max_w);
-        let cell_h = max_h.max(line_h).max(1);
+        let slot_h = max_h.max(line_h).max(1);
 
         let cols: u32 = 16;
         let rows = (glyph_ids.len() as u32 + cols - 1) / cols;
         let atlas_w = (cols * slot_w).max(1);
-        let atlas_h = (rows * cell_h).max(1);
+        let atlas_h = (rows * slot_h).max(1);
 
         let mut pixels = vec![0u8; (atlas_w * atlas_h) as usize];
         let mut glyphs: HashMap<u16, GlyphMetrics> = HashMap::new();
@@ -140,7 +143,7 @@ impl GlyphAtlas {
             let col = i as u32 % cols;
             let row = i as u32 / cols;
             let ox  = col * slot_w;
-            let oy  = row * cell_h;
+            let oy  = row * slot_h;
 
             for y in 0..m.height {
                 for x in 0..m.width {
@@ -181,7 +184,7 @@ impl GlyphAtlas {
         Ok(Self {
             texture,
             cell_w: cell_w as f32,
-            line_height: cell_h as f32,
+            line_height: line_h as f32,
             ascent,
             glyphs,
         })

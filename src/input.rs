@@ -38,10 +38,15 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
                 return Ok(true);
             }
             Key::X => { app.active_tab_mut().close_focused_pane(); return Ok(true); }
-            Key::Tab => { app.active_tab_mut().cycle_focus(true); return Ok(true); }
+            Key::Tab => { app.prev_tab(); return Ok(true); }
             Key::Q => { app.running = false; return Ok(true); }
             _ => {}
         }
+    }
+
+    if ctrl && key == Key::Tab {
+        app.next_tab();
+        return Ok(true);
     }
 
     if ctrl && key == Key::W {

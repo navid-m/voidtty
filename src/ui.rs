@@ -12,10 +12,9 @@ impl Rect {
 }
 
 const BASE_TAB_BAR_H: f32 = 28.0;
-const BASE_TAB_INDICATOR_SIZE: f32 = 16.0;
-const BASE_TAB_INDICATOR_RADIUS: f32 = 4.5;
-const BASE_TAB_INDICATOR_GAP: f32 = 10.0;
-const BASE_TAB_BAR_PAD: f32 = 9.0;
+const BASE_TAB_BAR_PAD: f32 = 10.0;
+const BASE_TAB_VPAD: f32 = 4.0;
+const BASE_TAB_GAP: f32 = 16.0;
 const BASE_PANE_PAD: f32 = 6.0;
 const BASE_SCROLLBAR_W: f32 = 6.0;
 const BASE_SCROLLBAR_GAP: f32 = 3.0;
@@ -25,10 +24,8 @@ const BASE_SCROLLBAR_GAP: f32 = 3.0;
 pub struct UiMetrics {
     pub scale: f32,
     pub tab_bar_h: f32,
-    pub tab_indicator_size: f32,
-    pub tab_indicator_radius: f32,
-    pub tab_indicator_gap: f32,
     pub tab_bar_pad: f32,
+    pub tab_gap: f32,
     pub pane_pad: f32,
     pub scrollbar_w: f32,
     /// Horizontal space reserved to the right of the text for the scrollbar.
@@ -45,14 +42,20 @@ impl UiMetrics {
         Self {
             scale,
             tab_bar_h: BASE_TAB_BAR_H * scale,
-            tab_indicator_size: BASE_TAB_INDICATOR_SIZE * scale,
-            tab_indicator_radius: BASE_TAB_INDICATOR_RADIUS * scale,
-            tab_indicator_gap: BASE_TAB_INDICATOR_GAP * scale,
             tab_bar_pad: BASE_TAB_BAR_PAD * scale,
+            tab_gap: BASE_TAB_GAP * scale,
             pane_pad: BASE_PANE_PAD * scale,
             scrollbar_w: BASE_SCROLLBAR_W * scale,
             scrollbar_gutter: (BASE_SCROLLBAR_W + BASE_SCROLLBAR_GAP) * scale,
         }
+    }
+
+    /// Grows the tab bar so tab titles fit the current font.
+    pub fn with_tab_bar_height(mut self, line_height: f32) -> Self {
+        self.tab_bar_h = self
+            .tab_bar_h
+            .max(line_height + BASE_TAB_VPAD * self.scale * 2.0);
+        self
     }
 }
 

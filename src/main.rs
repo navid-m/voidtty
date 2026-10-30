@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         .context("creating GLFW window")?;
 
     let content_scale = window.get_content_scale();
-    let ui = UiMetrics::new(content_scale.0.max(content_scale.1));
+    let mut ui = UiMetrics::new(content_scale.0.max(content_scale.1));
 
     window.make_current();
     window.set_key_polling(true);
@@ -64,6 +64,7 @@ fn main() -> Result<()> {
         fh as u32,
     )
     .context("initialising renderer")?;
+    ui = ui.with_tab_bar_height(renderer.line_height());
 
     let mut app = App::new(config)?;
 
@@ -79,6 +80,7 @@ fn main() -> Result<()> {
         }
         if (renderer.font_size - app.config.font_size).abs() > f32::EPSILON {
             renderer.set_font_size(app.config.font_size)?;
+            ui = ui.with_tab_bar_height(renderer.line_height());
             resize_ptys(&mut app, &renderer, ui);
         }
         draw_frame(&mut renderer, &app, ui)?;
@@ -342,62 +344,71 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
         ui.tab_bar_h,
     );
 
-    // Tab bar background with a subtle dark-blue separator below it.
-    renderer.draw_rect(
-        0.0,
-        0.0,
-        renderer.win_w,
-        ui.tab_bar_h,
-        0.04,
-        0.045,
-        0.07,
-        opacity,
-    );
-    renderer.draw_rect(
-        0.0,
-        ui.tab_bar_h - ui.scale,
-        renderer.win_w,
-        ui.scale,
-        0.10,
-        0.13,
-        0.20,
-        opacity,
-    );
+    // Integrated tab strip: same black background as the terminal, with a
+    // Unicode status dot and the terminal title for each tab.
+    let tab_cw = renderer.cell_w();
+    let tab_lh = renderer.line_height();
+    let tab_text_y = (ui.tab_bar_h - tab_lh) * 0.5;
+    let mut tab_x = ui.tab_bar_pad;
 
-    // DPI-scaled tab indicators: independent of the terminal font size.
-    let size = ui.tab_indicator_size;
-    let y = (ui.tab_bar_h - size) * 0.5;
     for (i, t) in app.tabs.iter().enumerate() {
         let active = i == app.active_tab;
-        let x = ui.tab_bar_pad + i as f32 * (size + ui.tab_indicator_gap);
+        let title = t
+            .panes
+            .get(t.focused)
+            .or_else(|| t.panes.first())
+            .map(|pane| pane.pty.screen.lock().unwrap().title().to_owned())
+            .unwrap_or_else(|| "Terminal".to_owned());
+        let title: String = title.chars().take(28).collect();
+        let label = format!("{} {}", if active { "●" } else { "○" }, title);
+        let cell_count = label.chars().count();
+        let width = cell_count as f32 * tab_cw;
         let (r, g, b) = tab_color(t.accent, active);
 
         if active {
-            let glow = 3.0 * ui.scale;
+            let bg = ui.tab_bar_pad * 0.4;
             renderer.draw_round_rect(
-                x - glow,
-                y - glow,
-                size + glow * 2.0,
-                size + glow * 2.0,
-                ui.tab_indicator_radius + glow,
+                tab_x - bg,
+                0.0,
+                width + bg * 2.0,
+                ui.tab_bar_h,
+                4.0 * ui.scale,
+                r * 0.5,
+                g * 0.5,
+                b * 0.5,
+                0.12 * opacity,
+            );
+            renderer.draw_rect(
+                tab_x,
+                ui.tab_bar_h - ui.scale,
+                width,
+                ui.scale,
                 r,
                 g,
                 b,
-                0.20 * opacity,
+                0.9 * opacity,
             );
         }
 
-        renderer.draw_round_rect(
-            x,
-            y,
-            size,
-            size,
-            ui.tab_indicator_radius,
-            r,
-            g,
-            b,
-            if active { opacity } else { 0.85 * opacity },
-        );
+        let mut colors = Vec::with_capacity(cell_count);
+        colors.push((r, g, b));
+        let fg = if active {
+            (0.92, 0.92, 0.95)
+        } else {
+            (0.55, 0.55, 0.60)
+        };
+        for _ in 1..cell_count {
+            colors.push(fg);
+        }
+        renderer.draw_text_styled(
+            &label,
+            &colors,
+            tab_x,
+            tab_text_y,
+            if active { 1.0 } else { 0.85 },
+        )?;
+
+        tab_x += width + ui.tab_gap;
     }
 
     // Pane borders + content.

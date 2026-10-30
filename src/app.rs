@@ -77,15 +77,6 @@ impl Tab {
     pub fn focused_pane_mut(&mut self) -> &mut Pane {
         &mut self.panes[self.focused]
     }
-
-    pub fn cycle_focus(&mut self, forward: bool) {
-        let n = self.panes.len();
-        if forward {
-            self.focused = (self.focused + 1) % n;
-        } else {
-            self.focused = (self.focused + n - 1) % n;
-        }
-    }
 }
 
 /// Root application state.

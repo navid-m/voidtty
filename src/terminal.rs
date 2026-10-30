@@ -87,6 +87,7 @@ pub struct Screen {
     /// Fractional wheel delta accumulated between whole-line scrolls.
     scroll_pending: f32,
     current_style: Style,
+    title: String,
 }
 
 impl Screen {
@@ -106,6 +107,7 @@ impl Screen {
             scroll_offset: 0,
             scroll_pending: 0.0,
             current_style: Style::default(),
+            title: "Terminal".to_owned(),
         }
     }
 
@@ -113,6 +115,19 @@ impl Screen {
     #[cfg(test)]
     pub fn visible_lines(&self) -> Vec<String> {
         self.grid.iter().map(|row| row_string(row)).collect()
+    }
+
+    /// Human-readable terminal title (from OSC 0/2).
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn set_title(&mut self, title: String) {
+        self.title = if title.is_empty() {
+            "Terminal".to_owned()
+        } else {
+            title
+        };
     }
 
     /// Number of rows in the viewport.
@@ -521,7 +536,15 @@ impl Perform for Performer {
 
     fn unhook(&mut self) {}
 
-    fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _: bool) {
+        // OSC 0 / OSC 2 set the window (tab) title.
+        if params.len() >= 2 && (params[0] == b"0" || params[0] == b"2") {
+            if let Ok(title) = std::str::from_utf8(params[1]) {
+                let title: String = title.chars().take(120).collect();
+                self.screen.lock().unwrap().set_title(title);
+            }
+        }
+    }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _: bool, action: char) {
         // Device / cursor queries reply on the shell's stdin.
@@ -657,6 +680,13 @@ impl Pty {
             rows as usize,
             scrollback_limit,
         )));
+        let shell_title = std::path::Path::new(shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("shell")
+            .to_owned();
+        screen.lock().unwrap().set_title(shell_title);
+
         let screen_clone = Arc::clone(&screen);
         let writer_clone = Arc::clone(&writer);
         let alive = Arc::new(AtomicBool::new(true));
@@ -806,6 +836,17 @@ mod tests {
         assert_eq!(screen.scroll_offset(), 2);
         screen.scroll_by(-1);
         assert_eq!(screen.scroll_offset(), 1);
+    }
+
+    #[test]
+    fn osc_updates_terminal_title() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        for byte in b"\x1b]2;my project\x07" {
+            parser.advance(&mut performer, *byte);
+        }
+        let screen = performer.screen.lock().unwrap();
+        assert_eq!(screen.title(), "my project");
     }
 
     #[test]
