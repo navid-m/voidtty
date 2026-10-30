@@ -94,6 +94,8 @@ pub struct App {
     pub active_tab: usize,
     pub config: Config,
     pub running: bool,
+    /// `(tab, pane)` whose scrollbar thumb is currently being dragged.
+    pub scroll_drag: Option<(usize, usize)>,
     next_accent: usize,
 }
 
@@ -105,6 +107,7 @@ impl App {
             active_tab: 0,
             config,
             running: true,
+            scroll_drag: None,
             next_accent: 1,
         })
     }

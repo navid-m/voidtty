@@ -13,7 +13,7 @@ use app::App;
 use config::Config;
 use renderer::Renderer;
 use terminal::{Color, Style};
-use ui::{UiMetrics, pane_rects, text_cols, text_rows};
+use ui::{Rect, UiMetrics, pane_rects, text_cols, text_rows};
 
 const FALLBACK_FONT: &[u8] = include_bytes!("../assets/font.ttf");
 
@@ -49,6 +49,8 @@ fn main() -> Result<()> {
     window.set_char_polling(true);
     window.set_framebuffer_size_polling(true);
     window.set_mouse_button_polling(true);
+    window.set_scroll_polling(true);
+    window.set_cursor_pos_polling(true);
     glfw.set_swap_interval(glfw::SwapInterval::Sync(1));
 
     gl::load_with(|s| window.get_proc_address(s));
@@ -102,7 +104,7 @@ fn process_events(
             WindowEvent::Char(c) => {
                 input::handle_char(c, app)?;
             }
-            WindowEvent::MouseButton(btn, glfw::Action::Press, _) => {
+            WindowEvent::Scroll(_, y) => {
                 let (mx, my) = window.get_cursor_pos();
                 let rects = pane_rects(
                     renderer.win_w,
@@ -110,12 +112,97 @@ fn process_events(
                     app.active_tab().panes.len(),
                     ui.tab_bar_h,
                 );
-                if let Some(idx) =
-                    ui::hit_pane(mx as f32 * ui.scale, my as f32 * ui.scale, &rects)
-                {
-                    app.active_tab_mut().focused = idx;
+                let index = ui::hit_pane(mx as f32 * ui.scale, my as f32 * ui.scale, &rects)
+                    .unwrap_or(app.active_tab().focused);
+                let tab = app.active_tab_mut();
+                if let Some(pane) = tab.panes.get(index) {
+                    pane.pty
+                        .screen
+                        .lock()
+                        .unwrap()
+                        .scroll_by_lines(y as f32);
                 }
-                let _ = btn;
+            }
+            WindowEvent::CursorPos(x, y) => {
+                if let Some((tab_idx, pane_idx)) = app.scroll_drag {
+                    if app
+                        .tabs
+                        .get(tab_idx)
+                        .is_some_and(|t| pane_idx < t.panes.len())
+                    {
+                        let rects = pane_rects(
+                            renderer.win_w,
+                            renderer.win_h,
+                            app.tabs[tab_idx].panes.len(),
+                            ui.tab_bar_h,
+                        );
+                        let rect = rects[pane_idx];
+                        let pane = &app.tabs[tab_idx].panes[pane_idx];
+                        let (max, rows) = {
+                            let screen = pane.pty.screen.lock().unwrap();
+                            (screen.max_scroll(), screen.rows())
+                        };
+                        if let Some(geom) = scrollbar_geometry(&rect, ui, max, rows) {
+                            let offset =
+                                scrollbar_offset_at(&geom, max, y as f32 * ui.scale);
+                            pane.pty
+                                .screen
+                                .lock()
+                                .unwrap()
+                                .set_scroll_offset(offset);
+                        }
+                    }
+                }
+                let _ = x;
+            }
+            WindowEvent::MouseButton(_, glfw::Action::Release, _) => {
+                app.scroll_drag = None;
+            }
+            WindowEvent::MouseButton(_, glfw::Action::Press, _) => {
+                let (mx, my) = window.get_cursor_pos();
+                let mx = mx as f32 * ui.scale;
+                let my = my as f32 * ui.scale;
+                let active = app.active_tab;
+                let rects = pane_rects(
+                    renderer.win_w,
+                    renderer.win_h,
+                    app.tabs[active].panes.len(),
+                    ui.tab_bar_h,
+                );
+
+                let mut grabbed_scrollbar = false;
+                for (idx, rect) in rects.iter().enumerate() {
+                    let (max, rows) = {
+                        let screen = app.tabs[active].panes[idx].pty.screen.lock().unwrap();
+                        (screen.max_scroll(), screen.rows())
+                    };
+                    let Some(geom) = scrollbar_geometry(rect, ui, max, rows) else {
+                        continue;
+                    };
+                    if mx >= geom.x
+                        && mx < geom.x + geom.w
+                        && my >= geom.y
+                        && my < geom.y + geom.track_h
+                    {
+                        let offset = scrollbar_offset_at(&geom, max, my);
+                        app.tabs[active].focused = idx;
+                        app.tabs[active].panes[idx]
+                            .pty
+                            .screen
+                            .lock()
+                            .unwrap()
+                            .set_scroll_offset(offset);
+                        app.scroll_drag = Some((active, idx));
+                        grabbed_scrollbar = true;
+                        break;
+                    }
+                }
+
+                if !grabbed_scrollbar {
+                    if let Some(idx) = ui::hit_pane(mx, my, &rects) {
+                        app.tabs[active].focused = idx;
+                    }
+                }
             }
             ev => {
                 input::handle_event(ev, app)?;
@@ -197,6 +284,49 @@ fn cell_colors(style: Style) -> ((f32, f32, f32), (f32, f32, f32), bool) {
     }
     let fill = style.reverse || style.bg != Color::Default;
     (fg, bg, fill)
+}
+
+struct ScrollbarGeom {
+    x: f32,
+    y: f32,
+    w: f32,
+    track_h: f32,
+    thumb_h: f32,
+}
+
+fn scrollbar_geometry(
+    rect: &Rect,
+    ui: UiMetrics,
+    max_scroll: usize,
+    rows: usize,
+) -> Option<ScrollbarGeom> {
+    if max_scroll == 0 {
+        return None;
+    }
+    let track_y = rect.y + ui.pane_pad;
+    let track_h = rect.h - ui.pane_pad * 2.0;
+    if track_h <= 0.0 {
+        return None;
+    }
+    let total = (max_scroll + rows) as f32;
+    let thumb_h = (track_h * rows as f32 / total)
+        .clamp((16.0 * ui.scale).min(track_h), track_h);
+    Some(ScrollbarGeom {
+        x: rect.x + rect.w - ui.pane_pad - ui.scrollbar_w,
+        y: track_y,
+        w: ui.scrollbar_w,
+        track_h,
+        thumb_h,
+    })
+}
+
+fn scrollbar_offset_at(geom: &ScrollbarGeom, max_scroll: usize, y: f32) -> usize {
+    let travel = (geom.track_h - geom.thumb_h).max(0.0);
+    if travel <= 0.0 {
+        return max_scroll;
+    }
+    let frac = ((y - geom.y) / travel).clamp(0.0, 1.0);
+    ((1.0 - frac) * max_scroll as f32).round() as usize
 }
 
 fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
@@ -293,29 +423,48 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
 
         // Terminal cells: backgrounds first, then shaped text with per-cell color.
         let screen = pane.pty.screen.lock().unwrap();
-        let rows = screen.visible_cells();
         let cw = renderer.cell_w();
         let lh = renderer.line_height();
+        let (cursor_row, cursor_col) = screen.cursor();
+        let show_cursor = focused && screen.scroll_offset() == 0;
 
-        for (row, cells) in rows.iter().enumerate() {
+        for (row, cells) in screen.display_rows().enumerate() {
             let y = rect.y + ui.pane_pad + row as f32 * lh;
-            let last = cells
+            let cursor_here = show_cursor && row == cursor_row;
+            let cursor_cell = cursor_here.then(|| cursor_col.min(cells.len().saturating_sub(1)));
+
+            let mut last = cells
                 .iter()
                 .rposition(|c| c.ch != ' ' || c.style != Style::default())
                 .map(|i| i + 1)
                 .unwrap_or(0);
+            if let Some(col) = cursor_cell {
+                last = last.max(col + 1);
+            }
             if last == 0 {
                 continue;
             }
 
             let mut colors = Vec::with_capacity(last);
             for (col, cell) in cells[..last].iter().enumerate() {
-                let (fg, bg, fill) = cell_colors(cell.style);
+                let style = if Some(col) == cursor_cell {
+                    // Solid, non-blinking block cursor.
+                    Style {
+                        fg: Color::Default,
+                        bg: Color::Default,
+                        bold: false,
+                        underline: false,
+                        reverse: true,
+                    }
+                } else {
+                    cell.style
+                };
+                let (fg, bg, fill) = cell_colors(style);
                 let x = rect.x + ui.pane_pad + col as f32 * cw;
                 if fill {
                     renderer.draw_rect(x, y, cw, lh, bg.0, bg.1, bg.2, opacity);
                 }
-                if cell.style.underline {
+                if style.underline {
                     renderer.draw_rect(x, y + lh - 1.5, cw, 1.0, fg.0, fg.1, fg.2, opacity);
                 }
                 colors.push(fg);
@@ -323,6 +472,24 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
 
             let text: String = cells[..last].iter().map(|c| c.ch).collect();
             renderer.draw_text_styled(&text, &colors, rect.x + ui.pane_pad, y, 1.0)?;
+        }
+
+        // Vertical scrollbar, drawn inside the pane's right padding.
+        let max_scroll = screen.max_scroll();
+        if let Some(geom) = scrollbar_geometry(rect, ui, max_scroll, screen.rows()) {
+            let radius = geom.w * 0.5;
+            let frac = screen.scroll_offset() as f32 / max_scroll as f32;
+            let thumb_y = geom.y + (geom.track_h - geom.thumb_h) * (1.0 - frac);
+
+            renderer.draw_round_rect(
+                geom.x, geom.y, geom.w, geom.track_h, radius,
+                1.0, 1.0, 1.0, 0.05 * opacity,
+            );
+            renderer.draw_round_rect(
+                geom.x, thumb_y, geom.w, geom.thumb_h, radius,
+                0.55, 0.60, 0.70,
+                if focused { 0.55 } else { 0.35 } * opacity,
+            );
         }
     }
 
@@ -341,7 +508,7 @@ fn resize_ptys(app: &mut App, renderer: &Renderer, ui: UiMetrics) {
             ui.tab_bar_h,
         );
         for (pane, rect) in tab.panes.iter_mut().zip(rects.iter()) {
-            let cols = text_cols(rect.w, cw, ui.pane_pad).max(1) as u16;
+            let cols = text_cols(rect.w, cw, ui.pane_pad, ui.scrollbar_gutter).max(1) as u16;
             let rows = text_rows(rect.h, lh, ui.pane_pad).max(1) as u16;
             let _ = pane.pty.resize(cols, rows);
         }

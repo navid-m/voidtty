@@ -59,6 +59,7 @@ impl Cell {
     }
 }
 
+#[cfg(test)]
 fn row_string(row: &[Cell]) -> String {
     let mut s: String = row.iter().map(|cell| cell.ch).collect();
     let trimmed = s.trim_end().len();
@@ -79,8 +80,12 @@ pub struct Screen {
     cursor_col: usize,
     saved_row: usize,
     saved_col: usize,
-    scrollback: Vec<String>,
+    scrollback: Vec<Vec<Cell>>,
     scrollback_limit: usize,
+    /// Number of lines scrolled up from the live screen (0 = bottom).
+    scroll_offset: usize,
+    /// Fractional wheel delta accumulated between whole-line scrolls.
+    scroll_pending: f32,
     current_style: Style,
 }
 
@@ -98,6 +103,8 @@ impl Screen {
             saved_col: 0,
             scrollback: Vec::new(),
             scrollback_limit,
+            scroll_offset: 0,
+            scroll_pending: 0.0,
             current_style: Style::default(),
         }
     }
@@ -108,9 +115,62 @@ impl Screen {
         self.grid.iter().map(|row| row_string(row)).collect()
     }
 
-    /// Returns the styled visible grid rows.
-    pub fn visible_cells(&self) -> &[Vec<Cell>] {
-        &self.grid
+    /// Number of rows in the viewport.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Cursor position as `(row, col)` within the live grid.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.cursor_row, self.cursor_col)
+    }
+
+    /// Maximum scroll offset (top of history).
+    pub fn max_scroll(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// Current scroll position, 0 = live screen, `max_scroll` = top.
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset.min(self.scrollback.len())
+    }
+
+    /// Scrolls `lines` lines up (positive) or down (negative).
+    pub fn scroll_by(&mut self, lines: isize) {
+        let max = self.scrollback.len() as isize;
+        self.scroll_offset = (self.scroll_offset as isize + lines).clamp(0, max) as usize;
+    }
+
+    /// Accumulates fractional wheel deltas and scrolls whole lines.
+    pub fn scroll_by_lines(&mut self, delta: f32) {
+        self.scroll_pending += delta;
+        let whole = self.scroll_pending.trunc();
+        if whole != 0.0 {
+            self.scroll_pending -= whole;
+            self.scroll_by(whole as isize);
+        }
+    }
+
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        self.scroll_offset = offset.min(self.scrollback.len());
+    }
+
+    /// Returns a row as currently displayed (history when scrolled up).
+    pub fn display_row(&self, row: usize) -> &[Cell] {
+        let offset = self.scroll_offset();
+        let history_rows = offset.min(self.rows);
+        let cells = if row < history_rows {
+            let index = self.scrollback.len() - history_rows + row;
+            &self.scrollback[index][..]
+        } else {
+            &self.grid[row - history_rows][..]
+        };
+        &cells[..cells.len().min(self.cols)]
+    }
+
+    /// Iterates over the rows currently visible in the viewport.
+    pub fn display_rows(&self) -> impl Iterator<Item = &[Cell]> {
+        (0..self.rows).map(move |row| self.display_row(row))
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -127,7 +187,7 @@ impl Screen {
         if rows < self.rows {
             let removed = self.rows - rows;
             for _ in 0..removed.min(self.grid.len()) {
-                let line = row_string(&self.grid.remove(0));
+                let line = self.grid.remove(0);
                 self.push_scrollback(line);
             }
             self.cursor_row = self.cursor_row.saturating_sub(removed);
@@ -138,16 +198,28 @@ impl Screen {
 
         self.cursor_row = self.cursor_row.min(self.rows - 1);
         self.cursor_col = self.cursor_col.min(self.cols - 1);
+        self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
     }
 
-    fn push_scrollback(&mut self, line: String) {
+    fn push_scrollback(&mut self, mut line: Vec<Cell>) {
         if self.scrollback_limit == 0 {
             return;
         }
-        self.scrollback.push(line.trim_end().to_owned());
+        while line
+            .last()
+            .is_some_and(|c| c.ch == ' ' && c.style == Style::default())
+        {
+            line.pop();
+        }
+        self.scrollback.push(line);
         if self.scrollback.len() > self.scrollback_limit {
             let drain = self.scrollback.len() - self.scrollback_limit;
             self.scrollback.drain(0..drain);
+            self.scroll_offset = self.scroll_offset.saturating_sub(drain);
+        }
+        // Keep the view anchored to the same history while scrolled up.
+        if self.scroll_offset > 0 {
+            self.scroll_offset = (self.scroll_offset + 1).min(self.scrollback.len());
         }
     }
 
@@ -221,7 +293,7 @@ impl Screen {
 
     fn scroll_up(&mut self, n: usize) {
         for _ in 0..n.min(self.rows) {
-            let line = row_string(&self.grid.remove(0));
+            let line = self.grid.remove(0);
             self.push_scrollback(line);
             self.grid.push(vec![Cell::default(); self.cols]);
         }
@@ -289,6 +361,7 @@ impl Screen {
                     row.fill(blank);
                 }
                 self.scrollback.clear();
+                self.scroll_offset = 0;
             }
             _ => {}
         }
@@ -359,6 +432,8 @@ impl Screen {
         self.saved_row = 0;
         self.saved_col = 0;
         self.scrollback.clear();
+        self.scroll_offset = 0;
+        self.scroll_pending = 0.0;
         self.current_style = Style::default();
     }
 }
@@ -699,6 +774,40 @@ mod tests {
         assert_eq!(&output.lock().unwrap()[..], b"\x1b[?1;2c");
     }
 
+    fn styled_row(text: &str) -> Vec<Cell> {
+        text.chars()
+            .map(|ch| Cell { ch, style: Style::default() })
+            .collect()
+    }
+
+    #[test]
+    fn scroll_view_shows_history_above_live_grid() {
+        let mut screen = Screen::new(4, 2, 10);
+        for c in "L0".chars() {
+            screen.print(c);
+        }
+        screen.cursor_col = 0;
+        screen.linefeed();
+        for c in "L1".chars() {
+            screen.print(c);
+        }
+
+        screen.push_scrollback(styled_row("H0"));
+        screen.push_scrollback(styled_row("H1"));
+
+        assert_eq!(row_string(screen.display_row(0)), "L0");
+        screen.set_scroll_offset(1);
+        assert_eq!(row_string(screen.display_row(0)), "H1");
+        assert_eq!(row_string(screen.display_row(1)), "L0");
+        screen.set_scroll_offset(2);
+        assert_eq!(row_string(screen.display_row(0)), "H0");
+        assert_eq!(row_string(screen.display_row(1)), "H1");
+        screen.set_scroll_offset(99);
+        assert_eq!(screen.scroll_offset(), 2);
+        screen.scroll_by(-1);
+        assert_eq!(screen.scroll_offset(), 1);
+    }
+
     #[test]
     fn applies_sgr_colors_and_attributes() {
         let (mut performer, _) = performer();
@@ -708,7 +817,7 @@ mod tests {
         }
 
         let screen = performer.screen.lock().unwrap();
-        let row = &screen.visible_cells()[0];
+        let row = screen.display_row(0);
         assert_eq!(row[0].ch, 'X');
         assert_eq!(row[0].style.fg, Color::Indexed(1));
         assert!(row[0].style.bold);
@@ -726,7 +835,7 @@ mod tests {
         }
 
         let screen = performer.screen.lock().unwrap();
-        let row = &screen.visible_cells()[0];
+        let row = screen.display_row(0);
         assert_eq!(row[0].style.fg, Color::Indexed(196));
         assert_eq!(row[1].style.bg, Color::Rgb(1, 2, 3));
     }

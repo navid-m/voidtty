@@ -17,6 +17,8 @@ const BASE_TAB_INDICATOR_RADIUS: f32 = 4.5;
 const BASE_TAB_INDICATOR_GAP: f32 = 10.0;
 const BASE_TAB_BAR_PAD: f32 = 9.0;
 const BASE_PANE_PAD: f32 = 6.0;
+const BASE_SCROLLBAR_W: f32 = 6.0;
+const BASE_SCROLLBAR_GAP: f32 = 3.0;
 
 /// UI metrics scaled for the display's DPI (Retina, HiDPI, …).
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +30,9 @@ pub struct UiMetrics {
     pub tab_indicator_gap: f32,
     pub tab_bar_pad: f32,
     pub pane_pad: f32,
+    pub scrollbar_w: f32,
+    /// Horizontal space reserved to the right of the text for the scrollbar.
+    pub scrollbar_gutter: f32,
 }
 
 impl UiMetrics {
@@ -45,13 +50,15 @@ impl UiMetrics {
             tab_indicator_gap: BASE_TAB_INDICATOR_GAP * scale,
             tab_bar_pad: BASE_TAB_BAR_PAD * scale,
             pane_pad: BASE_PANE_PAD * scale,
+            scrollbar_w: BASE_SCROLLBAR_W * scale,
+            scrollbar_gutter: (BASE_SCROLLBAR_W + BASE_SCROLLBAR_GAP) * scale,
         }
     }
 }
 
 /// Number of text columns that fit in a pane of the given width.
-pub fn text_cols(rect_w: f32, cell_w: f32, pane_pad: f32) -> usize {
-    ((rect_w - pane_pad * 2.0).max(0.0) / cell_w).floor() as usize
+pub fn text_cols(rect_w: f32, cell_w: f32, pane_pad: f32, scrollbar_gutter: f32) -> usize {
+    ((rect_w - pane_pad * 2.0 - scrollbar_gutter).max(0.0) / cell_w).floor() as usize
 }
 
 /// Number of text rows that fit in a pane of the given height.
