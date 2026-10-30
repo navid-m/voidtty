@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Bundle app
+        run: |
+          set -eu
+          APP=voidtty.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/voidtty "$APP/Contents/MacOS/voidtty"
+          cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>voidtty</string>
+            <key>CFBundleDisplayName</key>
+            <string>voidtty</string>
+            <key>CFBundleIdentifier</key>
+            <string>dev.voidtty.app</string>
+            <key>CFBundleVersion</key>
+            <string>0.1.0</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.1.0</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleExecutable</key>
+            <string>voidtty</string>
+            <key>CFBundleIconFile</key>
+            <string>icon.icns</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --deep --sign - "$APP"
+          mkdir -p dist
+          ditto -c -k --keepParent "$APP" dist/voidtty-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voidtty-macos
+          path: dist/voidtty-macos.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xorg-dev libgl1-mesa-dev libxkbcommon-dev
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          set -eu
+          mkdir -p dist staging
+          cp target/release/voidtty staging/voidtty
+          cp assets/icon.png staging/voidtty.png
+          cat > staging/voidtty.desktop <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=voidtty
+          Comment=GPU-accelerated terminal emulator
+          Exec=voidtty
+          Icon=voidtty
+          Terminal=false
+          Categories=System;TerminalEmulator;
+          DESKTOP
+          zip -j dist/voidtty-linux.zip staging/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voidtty-linux
+          path: dist/voidtty-linux.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/voidtty.exe -DestinationPath dist/voidtty-windows.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voidtty-windows
+          path: dist/voidtty-windows.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: voidtty-*
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

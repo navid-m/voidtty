@@ -44,6 +44,8 @@ fn main() -> Result<()> {
     let content_scale = window.get_content_scale();
     let mut ui = UiMetrics::new(content_scale.0.max(content_scale.1));
 
+    set_window_icon(&mut window);
+
     window.make_current();
     window.set_key_polling(true);
     window.set_char_polling(true);
@@ -535,6 +537,40 @@ fn resize_ptys(app: &mut App, renderer: &Renderer, ui: UiMetrics) {
             }
         }
     }
+}
+
+/// Sets the window/taskbar icon from the bundled PNG. macOS uses the icon in
+/// the app bundle instead, so this mainly affects Windows and Linux.
+fn set_window_icon(window: &mut glfw::Window) {
+    let bytes = include_bytes!("../assets/icon.png");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let Ok(mut reader) = decoder.read_info() else {
+        return;
+    };
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let Ok(info) = reader.next_frame(&mut buffer) else {
+        return;
+    };
+    if info.bit_depth != png::BitDepth::Eight {
+        return;
+    }
+    let data = &buffer[..info.buffer_size()];
+    let pixels: Vec<u32> = match info.color_type {
+        png::ColorType::Rgba => data
+            .chunks_exact(4)
+            .map(|px| u32::from_ne_bytes([px[0], px[1], px[2], px[3]]))
+            .collect(),
+        png::ColorType::Rgb => data
+            .chunks_exact(3)
+            .map(|px| u32::from_ne_bytes([px[0], px[1], px[2], 0xff]))
+            .collect(),
+        _ => return,
+    };
+    window.set_icon_from_pixels(vec![glfw::PixelImage {
+        width: info.width,
+        height: info.height,
+        pixels,
+    }]);
 }
 
 fn load_font(config: &Config) -> font::LoadedFont {
