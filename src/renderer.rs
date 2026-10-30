@@ -8,9 +8,12 @@ use std::ffi::CString;
 
 #[derive(Clone, Copy)]
 pub struct GlyphMetrics {
-    pub u0: f32, pub v0: f32,
-    pub u1: f32, pub v1: f32,
-    pub bw: f32, pub bh: f32,
+    pub u0: f32,
+    pub v0: f32,
+    pub u1: f32,
+    pub v1: f32,
+    pub bw: f32,
+    pub bh: f32,
     /// Horizontal offset from pen to bitmap left edge.
     pub xoff: f32,
     /// Vertical offset from baseline to bitmap top edge.
@@ -18,10 +21,10 @@ pub struct GlyphMetrics {
 }
 
 pub struct GlyphAtlas {
-    pub texture:     GLuint,
-    pub cell_w:      f32,
+    pub texture: GLuint,
+    pub cell_w: f32,
     pub line_height: f32,
-    pub ascent:      f32,
+    pub ascent: f32,
     glyphs: HashMap<u16, GlyphMetrics>,
 }
 
@@ -84,8 +87,8 @@ impl GlyphAtlas {
             collection_index: face_index,
             ..FontSettings::default()
         };
-        let font = Font::from_bytes(font_data, settings)
-            .map_err(|e| anyhow::anyhow!("fontdue: {e}"))?;
+        let font =
+            Font::from_bytes(font_data, settings).map_err(|e| anyhow::anyhow!("fontdue: {e}"))?;
 
         let glyph_count = font.glyph_count();
         let glyph_ids: Vec<u16> = glyph_ids
@@ -142,8 +145,8 @@ impl GlyphAtlas {
             let (m, bitmap) = font.rasterize_indexed(id, font_size);
             let col = i as u32 % cols;
             let row = i as u32 / cols;
-            let ox  = col * slot_w;
-            let oy  = row * slot_h;
+            let ox = col * slot_w;
+            let oy = row * slot_h;
 
             for y in 0..m.height {
                 for x in 0..m.width {
@@ -152,16 +155,19 @@ impl GlyphAtlas {
                 }
             }
 
-            glyphs.insert(id, GlyphMetrics {
-                u0: ox as f32 / atlas_w as f32,
-                v0: oy as f32 / atlas_h as f32,
-                u1: (ox + m.width as u32)  as f32 / atlas_w as f32,
-                v1: (oy + m.height as u32) as f32 / atlas_h as f32,
-                bw: m.width as f32,
-                bh: m.height as f32,
-                xoff: m.xmin as f32,
-                yoff: m.ymin as f32,
-            });
+            glyphs.insert(
+                id,
+                GlyphMetrics {
+                    u0: ox as f32 / atlas_w as f32,
+                    v0: oy as f32 / atlas_h as f32,
+                    u1: (ox + m.width as u32) as f32 / atlas_w as f32,
+                    v1: (oy + m.height as u32) as f32 / atlas_h as f32,
+                    bw: m.width as f32,
+                    bh: m.height as f32,
+                    xoff: m.xmin as f32,
+                    yoff: m.ymin as f32,
+                },
+            );
         }
 
         let mut texture = 0u32;
@@ -174,9 +180,14 @@ impl GlyphAtlas {
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
             gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
             gl::TexImage2D(
-                gl::TEXTURE_2D, 0, gl::RED as i32,
-                atlas_w as i32, atlas_h as i32, 0,
-                gl::RED, gl::UNSIGNED_BYTE,
+                gl::TEXTURE_2D,
+                0,
+                gl::RED as i32,
+                atlas_w as i32,
+                atlas_h as i32,
+                0,
+                gl::RED,
+                gl::UNSIGNED_BYTE,
                 pixels.as_ptr().cast(),
             );
         }
@@ -286,7 +297,7 @@ void main() {
 fn compile_shader(src: &str, kind: GLenum) -> Result<GLuint> {
     unsafe {
         let id = gl::CreateShader(kind);
-        let c  = CString::new(src).unwrap();
+        let c = CString::new(src).unwrap();
         gl::ShaderSource(id, 1, &c.as_ptr(), std::ptr::null());
         gl::CompileShader(id);
         let mut ok = 0i32;
@@ -326,13 +337,38 @@ fn link_program(vs: GLuint, fs: GLuint) -> Result<GLuint> {
 // ── Vertex types ──────────────────────────────────────────────────────────────
 
 #[repr(C)]
-struct TV { x: f32, y: f32, u: f32, v: f32, r: f32, g: f32, b: f32, a: f32 }
+struct TV {
+    x: f32,
+    y: f32,
+    u: f32,
+    v: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+}
 
 #[repr(C)]
-struct RV { x: f32, y: f32, r: f32, g: f32, b: f32, a: f32 }
+struct RV {
+    x: f32,
+    y: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+}
 
 #[repr(C)]
-struct R2V { x: f32, y: f32, lx: f32, ly: f32, r: f32, g: f32, b: f32, a: f32 }
+struct R2V {
+    x: f32,
+    y: f32,
+    lx: f32,
+    ly: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+}
 
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
@@ -340,10 +376,10 @@ pub struct Renderer {
     prog_text: GLuint,
     prog_rect: GLuint,
     prog_round: GLuint,
-    vao_text:  GLuint,
-    vbo_text:  GLuint,
-    vao_rect:  GLuint,
-    vbo_rect:  GLuint,
+    vao_text: GLuint,
+    vbo_text: GLuint,
+    vao_rect: GLuint,
+    vbo_rect: GLuint,
     vao_round: GLuint,
     vbo_round: GLuint,
     pub atlas: GlyphAtlas,
@@ -389,15 +425,10 @@ impl Renderer {
             compile_shader(FS_ROUND, gl::FRAGMENT_SHADER)?,
         )?;
 
-        let (vao_text, vbo_text) = unsafe { make_vao::<TV>(
-            &[(0, 2, 0), (1, 2, 8), (2, 4, 16)],
-        )};
-        let (vao_rect, vbo_rect) = unsafe { make_vao::<RV>(
-            &[(0, 2, 0), (1, 4, 8)],
-        )};
-        let (vao_round, vbo_round) = unsafe { make_vao::<R2V>(
-            &[(0, 2, 0), (1, 2, 8), (2, 4, 16)],
-        )};
+        let (vao_text, vbo_text) = unsafe { make_vao::<TV>(&[(0, 2, 0), (1, 2, 8), (2, 4, 16)]) };
+        let (vao_rect, vbo_rect) = unsafe { make_vao::<RV>(&[(0, 2, 0), (1, 4, 8)]) };
+        let (vao_round, vbo_round) =
+            unsafe { make_vao::<R2V>(&[(0, 2, 0), (1, 2, 8), (2, 4, 16)]) };
 
         unsafe {
             gl::Enable(gl::BLEND);
@@ -406,10 +437,15 @@ impl Renderer {
         }
 
         Ok(Self {
-            prog_text, prog_rect, prog_round,
-            vao_text, vbo_text,
-            vao_rect, vbo_rect,
-            vao_round, vbo_round,
+            prog_text,
+            prog_rect,
+            prog_round,
+            vao_text,
+            vbo_text,
+            vao_rect,
+            vbo_rect,
+            vao_round,
+            vbo_round,
             atlas,
             win_w: win_w as f32,
             win_h: win_h as f32,
@@ -426,7 +462,9 @@ impl Renderer {
         let atlas = GlyphAtlas::build(&self.font_data, self.face_index, self.font_size, &ids)
             .context("rebuilding glyph atlas")?;
         let old = std::mem::replace(&mut self.atlas, atlas);
-        unsafe { gl::DeleteTextures(1, &old.texture); }
+        unsafe {
+            gl::DeleteTextures(1, &old.texture);
+        }
         Ok(())
     }
 
@@ -442,7 +480,9 @@ impl Renderer {
     pub fn resize(&mut self, w: u32, h: u32) {
         self.win_w = w as f32;
         self.win_h = h as f32;
-        unsafe { gl::Viewport(0, 0, w as i32, h as i32); }
+        unsafe {
+            gl::Viewport(0, 0, w as i32, h as i32);
+        }
     }
 
     pub fn clear(&self, r: f32, g: f32, b: f32, a: f32) {
@@ -455,10 +495,21 @@ impl Renderer {
     /// Draws a filled axis-aligned rectangle in pixel coordinates.
     pub fn draw_rect(&self, x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32, a: f32) {
         let (x1, y1) = (x + w, y + h);
-        let mk = |px: f32, py: f32| RV { x: px, y: py, r, g, b, a };
+        let mk = |px: f32, py: f32| RV {
+            x: px,
+            y: py,
+            r,
+            g,
+            b,
+            a,
+        };
         let verts = [
-            mk(x, y), mk(x1, y), mk(x, y1),
-            mk(x1, y), mk(x1, y1), mk(x, y1),
+            mk(x, y),
+            mk(x1, y),
+            mk(x, y1),
+            mk(x1, y),
+            mk(x1, y1),
+            mk(x, y1),
         ];
         unsafe {
             gl::UseProgram(self.prog_rect);
@@ -470,20 +521,36 @@ impl Renderer {
     /// Draws a filled rounded rectangle using a signed-distance fragment shader.
     pub fn draw_round_rect(
         &self,
-        x: f32, y: f32, w: f32, h: f32, radius: f32,
-        r: f32, g: f32, b: f32, a: f32,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        r: f32,
+        g: f32,
+        b: f32,
+        a: f32,
     ) {
         let radius = radius.clamp(0.0, w.min(h) * 0.5);
         let (x1, y1) = (x + w, y + h);
         let (cx, cy) = (x + w * 0.5, y + h * 0.5);
         let mk = |px: f32, py: f32| R2V {
-            x: px, y: py,
-            lx: px - cx, ly: py - cy,
-            r, g, b, a,
+            x: px,
+            y: py,
+            lx: px - cx,
+            ly: py - cy,
+            r,
+            g,
+            b,
+            a,
         };
         let verts = [
-            mk(x, y), mk(x1, y), mk(x, y1),
-            mk(x1, y), mk(x1, y1), mk(x, y1),
+            mk(x, y),
+            mk(x1, y),
+            mk(x, y1),
+            mk(x1, y),
+            mk(x1, y1),
+            mk(x, y1),
         ];
         unsafe {
             gl::UseProgram(self.prog_round);
@@ -536,7 +603,9 @@ impl Renderer {
                 Err(0) => 0,
                 Err(i) => byte_to_cell[i - 1].1,
             };
-            let Some(gm) = self.atlas.get(sg.glyph_id) else { continue };
+            let Some(gm) = self.atlas.get(sg.glyph_id) else {
+                continue;
+            };
             let (r, g, b) = colors.get(cell_idx).copied().unwrap_or(fallback);
 
             let x0 = px + cell_idx as f32 * cell_w + sg.x_offset + gm.xoff;
@@ -545,10 +614,23 @@ impl Renderer {
             let y1 = y0 + gm.bh;
 
             for &(x, y, u, v) in &[
-                (x0, y0, gm.u0, gm.v0), (x1, y0, gm.u1, gm.v0), (x0, y1, gm.u0, gm.v1),
-                (x1, y0, gm.u1, gm.v0), (x1, y1, gm.u1, gm.v1), (x0, y1, gm.u0, gm.v1),
+                (x0, y0, gm.u0, gm.v0),
+                (x1, y0, gm.u1, gm.v0),
+                (x0, y1, gm.u0, gm.v1),
+                (x1, y0, gm.u1, gm.v0),
+                (x1, y1, gm.u1, gm.v1),
+                (x0, y1, gm.u0, gm.v1),
             ] {
-                verts.push(TV { x, y, u, v, r, g, b, a: alpha });
+                verts.push(TV {
+                    x,
+                    y,
+                    u,
+                    v,
+                    r,
+                    g,
+                    b,
+                    a: alpha,
+                });
             }
         }
 
@@ -567,57 +649,72 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn cell_w(&self)      -> f32 { self.atlas.cell_w }
-    pub fn line_height(&self) -> f32 { self.atlas.line_height }
+    pub fn cell_w(&self) -> f32 {
+        self.atlas.cell_w
+    }
+    pub fn line_height(&self) -> f32 {
+        self.atlas.line_height
+    }
 }
 
 // ── GL helpers ────────────────────────────────────────────────────────────────
 
 /// Creates a VAO+VBO pair with the given attribute layout.
 /// Each entry is `(location, component_count, byte_offset)`.
-unsafe fn make_vao<T>(attribs: &[(u32, i32, usize)]) -> (GLuint, GLuint) { unsafe {
-    let mut vao = 0u32; let mut vbo = 0u32;
-    gl::GenVertexArrays(1, &mut vao);
-    gl::GenBuffers(1, &mut vbo);
-    gl::BindVertexArray(vao);
-    gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-    let stride = std::mem::size_of::<T>() as i32;
-    for &(loc, count, off) in attribs {
-        gl::VertexAttribPointer(loc, count, gl::FLOAT, gl::FALSE, stride, off as *const _);
-        gl::EnableVertexAttribArray(loc);
+unsafe fn make_vao<T>(attribs: &[(u32, i32, usize)]) -> (GLuint, GLuint) {
+    unsafe {
+        let mut vao = 0u32;
+        let mut vbo = 0u32;
+        gl::GenVertexArrays(1, &mut vao);
+        gl::GenBuffers(1, &mut vbo);
+        gl::BindVertexArray(vao);
+        gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+        let stride = std::mem::size_of::<T>() as i32;
+        for &(loc, count, off) in attribs {
+            gl::VertexAttribPointer(loc, count, gl::FLOAT, gl::FALSE, stride, off as *const _);
+            gl::EnableVertexAttribArray(loc);
+        }
+        (vao, vbo)
     }
-    (vao, vbo)
-}}
+}
 
-unsafe fn upload_and_draw<T>(vao: GLuint, vbo: GLuint, data: &[T], count: i32) { unsafe {
-    gl::BindVertexArray(vao);
-    gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-    gl::BufferData(
-        gl::ARRAY_BUFFER,
-        (data.len() * std::mem::size_of::<T>()) as isize,
-        data.as_ptr().cast(),
-        gl::DYNAMIC_DRAW,
-    );
-    gl::DrawArrays(gl::TRIANGLES, 0, count);
-}}
+unsafe fn upload_and_draw<T>(vao: GLuint, vbo: GLuint, data: &[T], count: i32) {
+    unsafe {
+        gl::BindVertexArray(vao);
+        gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+        gl::BufferData(
+            gl::ARRAY_BUFFER,
+            (data.len() * std::mem::size_of::<T>()) as isize,
+            data.as_ptr().cast(),
+            gl::DYNAMIC_DRAW,
+        );
+        gl::DrawArrays(gl::TRIANGLES, 0, count);
+    }
+}
 
-unsafe fn uniform2f(prog: GLuint, name: &str, x: f32, y: f32) { unsafe {
-    let cname = CString::new(name).unwrap();
-    let loc = gl::GetUniformLocation(prog, cname.as_ptr());
-    gl::Uniform2f(loc, x, y);
-}}
+unsafe fn uniform2f(prog: GLuint, name: &str, x: f32, y: f32) {
+    unsafe {
+        let cname = CString::new(name).unwrap();
+        let loc = gl::GetUniformLocation(prog, cname.as_ptr());
+        gl::Uniform2f(loc, x, y);
+    }
+}
 
-unsafe fn uniform1i(prog: GLuint, name: &str, v: i32) { unsafe {
-    let cname = CString::new(name).unwrap();
-    let loc = gl::GetUniformLocation(prog, cname.as_ptr());
-    gl::Uniform1i(loc, v);
-}}
+unsafe fn uniform1i(prog: GLuint, name: &str, v: i32) {
+    unsafe {
+        let cname = CString::new(name).unwrap();
+        let loc = gl::GetUniformLocation(prog, cname.as_ptr());
+        gl::Uniform1i(loc, v);
+    }
+}
 
-unsafe fn uniform1f(prog: GLuint, name: &str, v: f32) { unsafe {
-    let cname = CString::new(name).unwrap();
-    let loc = gl::GetUniformLocation(prog, cname.as_ptr());
-    gl::Uniform1f(loc, v);
-}}
+unsafe fn uniform1f(prog: GLuint, name: &str, v: f32) {
+    unsafe {
+        let cname = CString::new(name).unwrap();
+        let loc = gl::GetUniformLocation(prog, cname.as_ptr());
+        gl::Uniform1f(loc, v);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -625,7 +722,9 @@ mod tests {
 
     #[test]
     fn shapes_common_ligatures_when_font_supports_them() {
-        let Some(font) = crate::font::load("Cascadia Code") else { return };
+        let Some(font) = crate::font::load("Cascadia Code") else {
+            return;
+        };
         for (lig, a, b) in [("->", "-", ">"), ("=>", "=", ">"), ("!=", "!", "=")] {
             let shaped = shape_text(&font.data, font.face_index, 18.0, lig);
             let isolated: Vec<u16> = a

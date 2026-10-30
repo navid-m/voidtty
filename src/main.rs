@@ -137,8 +137,7 @@ fn process_events(
                                 (screen.max_scroll(), screen.rows())
                             };
                             if let Some(geom) = scrollbar_geometry(&content, ui, max, rows) {
-                                let offset =
-                                    scrollbar_offset_at(&geom, max, y as f32 * ui.scale);
+                                let offset = scrollbar_offset_at(&geom, max, y as f32 * ui.scale);
                                 pane.active()
                                     .pty
                                     .screen
@@ -190,9 +189,7 @@ fn process_events(
                     }
                 }
 
-                if !grabbed_scrollbar
-                    && let Some(id) = ui::hit_pane(mx, my, &rects)
-                {
+                if !grabbed_scrollbar && let Some(id) = ui::hit_pane(mx, my, &rects) {
                     app.focused = id;
                 }
             }
@@ -233,10 +230,22 @@ const DEFAULT_FG: (f32, f32, f32) = (0.90, 0.90, 0.90);
 const DEFAULT_BG: (f32, f32, f32) = (0.0, 0.0, 0.0);
 
 const ANSI_COLORS: [[f32; 3]; 16] = [
-    [0.00, 0.00, 0.00], [0.80, 0.25, 0.25], [0.35, 0.70, 0.35], [0.80, 0.70, 0.30],
-    [0.30, 0.50, 0.90], [0.70, 0.40, 0.85], [0.30, 0.70, 0.80], [0.80, 0.80, 0.80],
-    [0.45, 0.45, 0.50], [1.00, 0.45, 0.45], [0.55, 0.95, 0.55], [1.00, 0.90, 0.45],
-    [0.50, 0.70, 1.00], [0.90, 0.60, 1.00], [0.50, 0.90, 0.95], [1.00, 1.00, 1.00],
+    [0.00, 0.00, 0.00],
+    [0.80, 0.25, 0.25],
+    [0.35, 0.70, 0.35],
+    [0.80, 0.70, 0.30],
+    [0.30, 0.50, 0.90],
+    [0.70, 0.40, 0.85],
+    [0.30, 0.70, 0.80],
+    [0.80, 0.80, 0.80],
+    [0.45, 0.45, 0.50],
+    [1.00, 0.45, 0.45],
+    [0.55, 0.95, 0.55],
+    [1.00, 0.90, 0.45],
+    [0.50, 0.70, 1.00],
+    [0.90, 0.60, 1.00],
+    [0.50, 0.90, 0.95],
+    [1.00, 1.00, 1.00],
 ];
 
 fn indexed_color(index: u8) -> (f32, f32, f32) {
@@ -267,7 +276,11 @@ fn color_rgb(color: Color, bold: bool) -> Option<(f32, f32, f32)> {
         Color::Rgb(r, g, b) => (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
     };
     if bold {
-        Some(((c.0 * 1.15).min(1.0), (c.1 * 1.15).min(1.0), (c.2 * 1.15).min(1.0)))
+        Some((
+            (c.0 * 1.15).min(1.0),
+            (c.1 * 1.15).min(1.0),
+            (c.2 * 1.15).min(1.0),
+        ))
     } else {
         Some(c)
     }
@@ -310,8 +323,7 @@ fn scrollbar_geometry(
         return None;
     }
     let total = (max_scroll + rows) as f32;
-    let thumb_h = (track_h * rows as f32 / total)
-        .clamp((16.0 * ui.scale).min(track_h), track_h);
+    let thumb_h = (track_h * rows as f32 / total).clamp((16.0 * ui.scale).min(track_h), track_h);
     Some(ScrollbarGeom {
         x: rect.x + rect.w - ui.pane_pad - ui.scrollbar_w,
         y: track_y,
@@ -376,7 +388,7 @@ fn draw_pane(
     let cw = renderer.cell_w();
     let lh = renderer.line_height();
     let (cursor_row, cursor_col) = screen.cursor();
-    let show_cursor = focused && screen.scroll_offset() == 0;
+    let show_cursor = focused && screen.scroll_offset() == 0 && screen.cursor_visible();
 
     for (row, cells) in screen.display_rows().enumerate() {
         let y = content.y + ui.pane_pad + row as f32 * lh;
@@ -432,12 +444,25 @@ fn draw_pane(
         let thumb_y = geom.y + (geom.track_h - geom.thumb_h) * (1.0 - frac);
 
         renderer.draw_round_rect(
-            geom.x, geom.y, geom.w, geom.track_h, radius,
-            1.0, 1.0, 1.0, 0.05 * opacity,
+            geom.x,
+            geom.y,
+            geom.w,
+            geom.track_h,
+            radius,
+            1.0,
+            1.0,
+            1.0,
+            0.05 * opacity,
         );
         renderer.draw_round_rect(
-            geom.x, thumb_y, geom.w, geom.thumb_h, radius,
-            0.55, 0.60, 0.70,
+            geom.x,
+            thumb_y,
+            geom.w,
+            geom.thumb_h,
+            radius,
+            0.55,
+            0.60,
+            0.70,
             if focused { 0.55 } else { 0.35 } * opacity,
         );
     }

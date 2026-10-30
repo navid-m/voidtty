@@ -1,8 +1,8 @@
-use anyhow::Result;
 use crate::{
     config::{self, Config},
     terminal::Pty,
 };
+use anyhow::Result;
 
 /// One tab within a pane: a single PTY session.
 pub struct Tab {
@@ -96,8 +96,7 @@ impl LayoutNode {
                 true
             }
             LayoutNode::Split { first, second, .. } => {
-                first.split_leaf(target, dir, new_id)
-                    || second.split_leaf(target, dir, new_id)
+                first.split_leaf(target, dir, new_id) || second.split_leaf(target, dir, new_id)
             }
         }
     }
@@ -384,8 +383,8 @@ impl App {
     /// Adjusts the font size by `delta` points, clamping to the allowed range
     /// and persisting the new value to settings.ini.
     pub fn change_font_size(&mut self, delta: f32) -> Result<()> {
-        let size = (self.config.font_size + delta)
-            .clamp(config::MIN_FONT_SIZE, config::MAX_FONT_SIZE);
+        let size =
+            (self.config.font_size + delta).clamp(config::MIN_FONT_SIZE, config::MAX_FONT_SIZE);
         if (size - self.config.font_size).abs() < f32::EPSILON {
             return Ok(());
         }

@@ -4,7 +4,7 @@
 //! programming fonts with ligatures (Fira Code, Cascadia Code, …). The bundled
 //! font is only used when no suitable system font can be found.
 
-use fontdb::{Database, FaceInfo, ID, Style, Stretch};
+use fontdb::{Database, FaceInfo, ID, Stretch, Style};
 
 /// A font file plus the index of the face to use within it.
 pub struct LoadedFont {
@@ -87,7 +87,10 @@ fn find_family(db: &Database, family: &str) -> Option<ID> {
             continue;
         }
         let rank = rank(face);
-        if best.as_ref().map_or(true, |(best_rank, _)| rank < *best_rank) {
+        if best
+            .as_ref()
+            .map_or(true, |(best_rank, _)| rank < *best_rank)
+        {
             best = Some((rank, face.id));
         }
     }
@@ -151,4 +154,3 @@ mod tests {
         );
     }
 }
-

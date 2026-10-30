@@ -10,7 +10,9 @@ pub struct Rect {
 }
 
 impl Rect {
-    pub fn new(x: f32, y: f32, w: f32, h: f32) -> Self { Self { x, y, w, h } }
+    pub fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h }
+    }
 }
 
 const BASE_TAB_BAR_H: f32 = 28.0;

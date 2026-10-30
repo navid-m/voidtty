@@ -58,8 +58,8 @@ impl Config {
                 .with_context(|| format!("writing default config to {}", path.display()))?;
             return Ok(default);
         }
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         Ok(Self::parse_ini(&raw))
     }
 
@@ -81,16 +81,42 @@ impl Config {
             if line.starts_with('#') || line.starts_with(';') || line.starts_with('[') {
                 continue;
             }
-            let Some((key, val)) = line.split_once('=') else { continue };
+            let Some((key, val)) = line.split_once('=') else {
+                continue;
+            };
             let (key, val) = (key.trim(), val.trim());
             match key {
-                "opacity"     => { if let Ok(v) = val.parse::<f32>()  { cfg.opacity    = v.clamp(0.0, 1.0); } }
-                "shell"       => { cfg.shell = val.to_owned(); }
-                "font_family" => { cfg.font_family = val.to_owned(); }
-                "font_size"   => { if let Ok(v) = val.parse::<f32>()  { cfg.font_size  = v.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE); } }
-                "scrollback"  => { if let Ok(v) = val.parse::<usize>() { cfg.scrollback = v; } }
-                "win_width"   => { if let Ok(v) = val.parse::<u32>()  { cfg.win_width  = v; } }
-                "win_height"  => { if let Ok(v) = val.parse::<u32>()  { cfg.win_height = v; } }
+                "opacity" => {
+                    if let Ok(v) = val.parse::<f32>() {
+                        cfg.opacity = v.clamp(0.0, 1.0);
+                    }
+                }
+                "shell" => {
+                    cfg.shell = val.to_owned();
+                }
+                "font_family" => {
+                    cfg.font_family = val.to_owned();
+                }
+                "font_size" => {
+                    if let Ok(v) = val.parse::<f32>() {
+                        cfg.font_size = v.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+                    }
+                }
+                "scrollback" => {
+                    if let Ok(v) = val.parse::<usize>() {
+                        cfg.scrollback = v;
+                    }
+                }
+                "win_width" => {
+                    if let Ok(v) = val.parse::<u32>() {
+                        cfg.win_width = v;
+                    }
+                }
+                "win_height" => {
+                    if let Ok(v) = val.parse::<u32>() {
+                        cfg.win_height = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -110,8 +136,13 @@ impl Config {
              scrollback = {}\n\
              win_width = {}\n\
              win_height = {}\n",
-            self.opacity, self.shell, self.font_family, self.font_size,
-            self.scrollback, self.win_width, self.win_height,
+            self.opacity,
+            self.shell,
+            self.font_family,
+            self.font_size,
+            self.scrollback,
+            self.win_width,
+            self.win_height,
         )
     }
 }

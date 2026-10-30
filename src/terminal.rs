@@ -39,7 +39,10 @@ pub struct Cell {
 
 impl Default for Cell {
     fn default() -> Self {
-        Self { ch: ' ', style: Style::default() }
+        Self {
+            ch: ' ',
+            style: Style::default(),
+        }
     }
 }
 
@@ -54,7 +57,11 @@ impl Cell {
         };
         Self {
             ch: ' ',
-            style: Style { fg, bg, ..Style::default() },
+            style: Style {
+                fg,
+                bg,
+                ..Style::default()
+            },
         }
     }
 }
@@ -65,6 +72,19 @@ fn row_string(row: &[Cell]) -> String {
     let trimmed = s.trim_end().len();
     s.truncate(trimmed);
     s
+}
+
+/// State saved while an alternate screen buffer is active. Full-screen programs
+/// such as Neovim and Helix switch to it and expect the normal screen (with the
+/// shell prompt) to come back untouched when they exit.
+#[derive(Clone)]
+struct SavedScreen {
+    grid: Vec<Vec<Cell>>,
+    cursor_row: usize,
+    cursor_col: usize,
+    saved_row: usize,
+    saved_col: usize,
+    current_style: Style,
 }
 
 /// Scrollback + visible screen buffer for one pane.
@@ -87,6 +107,10 @@ pub struct Screen {
     /// Fractional wheel delta accumulated between whole-line scrolls.
     scroll_pending: f32,
     current_style: Style,
+    /// Normal-screen state while the alternate screen is active.
+    alt_screen: Option<SavedScreen>,
+    /// DECTCEM cursor visibility (`CSI ?25h` / `CSI ?25l`).
+    cursor_visible: bool,
     title: String,
 }
 
@@ -107,6 +131,8 @@ impl Screen {
             scroll_offset: 0,
             scroll_pending: 0.0,
             current_style: Style::default(),
+            alt_screen: None,
+            cursor_visible: true,
             title: "Terminal".to_owned(),
         }
     }
@@ -140,8 +166,16 @@ impl Screen {
         (self.cursor_row, self.cursor_col)
     }
 
+    /// Whether the program running in the pane wants the cursor shown.
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor_visible
+    }
+
     /// Maximum scroll offset (top of history).
     pub fn max_scroll(&self) -> usize {
+        if self.alt_screen.is_some() {
+            return 0;
+        }
         self.scrollback.len()
     }
 
@@ -152,6 +186,9 @@ impl Screen {
 
     /// Scrolls `lines` lines up (positive) or down (negative).
     pub fn scroll_by(&mut self, lines: isize) {
+        if self.alt_screen.is_some() {
+            return;
+        }
         let max = self.scrollback.len() as isize;
         self.scroll_offset = (self.scroll_offset as isize + lines).clamp(0, max) as usize;
     }
@@ -167,6 +204,9 @@ impl Screen {
     }
 
     pub fn set_scroll_offset(&mut self, offset: usize) {
+        if self.alt_screen.is_some() {
+            return;
+        }
         self.scroll_offset = offset.min(self.scrollback.len());
     }
 
@@ -207,7 +247,8 @@ impl Screen {
             }
             self.cursor_row = self.cursor_row.saturating_sub(removed);
         } else if rows > self.rows {
-            self.grid.resize_with(rows, || vec![Cell::default(); self.cols]);
+            self.grid
+                .resize_with(rows, || vec![Cell::default(); self.cols]);
         }
         self.rows = rows;
 
@@ -217,7 +258,9 @@ impl Screen {
     }
 
     fn push_scrollback(&mut self, mut line: Vec<Cell>) {
-        if self.scrollback_limit == 0 {
+        // The alternate screen has no scrollback of its own; keep the normal
+        // screen's history intact so it reappears when the program exits.
+        if self.alt_screen.is_some() || self.scrollback_limit == 0 {
             return;
         }
         while line
@@ -243,7 +286,10 @@ impl Screen {
             self.cursor_col = 0;
             self.linefeed();
         }
-        self.grid[self.cursor_row][self.cursor_col] = Cell { ch: c, style: self.current_style };
+        self.grid[self.cursor_row][self.cursor_col] = Cell {
+            ch: c,
+            style: self.current_style,
+        };
         self.cursor_col += 1;
     }
 
@@ -375,7 +421,9 @@ impl Screen {
                 for row in &mut self.grid {
                     row.fill(blank);
                 }
-                self.scrollback.clear();
+                if self.alt_screen.is_none() {
+                    self.scrollback.clear();
+                }
                 self.scroll_offset = 0;
             }
             _ => {}
@@ -401,7 +449,8 @@ impl Screen {
 
     fn insert_lines(&mut self, n: usize) {
         for _ in 0..n.min(self.rows - self.cursor_row) {
-            self.grid.insert(self.cursor_row, vec![Cell::default(); self.cols]);
+            self.grid
+                .insert(self.cursor_row, vec![Cell::default(); self.cols]);
             self.grid.pop();
         }
     }
@@ -438,6 +487,59 @@ impl Screen {
         row[start..end].fill(blank);
     }
 
+    fn set_cursor_visible(&mut self, visible: bool) {
+        self.cursor_visible = visible;
+    }
+
+    /// Switches between the normal and alternate screen buffers. Entering saves
+    /// the normal screen and optionally clears the alternate one; leaving
+    /// restores the normal screen exactly as it was before the program started.
+    fn set_alt_screen(&mut self, enable: bool, clear: bool) {
+        if enable {
+            if self.alt_screen.is_some() {
+                if clear {
+                    for row in &mut self.grid {
+                        row.fill(Cell::default());
+                    }
+                    self.cursor_row = 0;
+                    self.cursor_col = 0;
+                }
+                return;
+            }
+            let saved = SavedScreen {
+                grid: std::mem::take(&mut self.grid),
+                cursor_row: self.cursor_row,
+                cursor_col: self.cursor_col,
+                saved_row: self.saved_row,
+                saved_col: self.saved_col,
+                current_style: self.current_style,
+            };
+            self.grid = vec![vec![Cell::default(); self.cols]; self.rows];
+            self.alt_screen = Some(saved);
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+            self.saved_row = 0;
+            self.saved_col = 0;
+            self.scroll_offset = 0;
+            self.scroll_pending = 0.0;
+            self.current_style = Style::default();
+        } else if let Some(saved) = self.alt_screen.take() {
+            let mut grid = saved.grid;
+            grid.resize_with(self.rows, || vec![Cell::default(); self.cols]);
+            for row in &mut grid {
+                row.resize(self.cols, Cell::default());
+            }
+            self.grid = grid;
+            self.cursor_row = saved.cursor_row.min(self.rows - 1);
+            self.cursor_col = saved.cursor_col.min(self.cols - 1);
+            self.saved_row = saved.saved_row;
+            self.saved_col = saved.saved_col;
+            self.current_style = saved.current_style;
+            self.scroll_offset = 0;
+            self.scroll_pending = 0.0;
+        }
+    }
+
     fn reset(&mut self) {
         for row in &mut self.grid {
             row.fill(Cell::default());
@@ -450,6 +552,8 @@ impl Screen {
         self.scroll_offset = 0;
         self.scroll_pending = 0.0;
         self.current_style = Style::default();
+        self.alt_screen = None;
+        self.cursor_visible = true;
     }
 }
 
@@ -547,6 +651,35 @@ impl Perform for Performer {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _: bool, action: char) {
+        // DEC private modes (`CSI ? Pm h` / `CSI ? Pm l`): alternate screen
+        // buffer and cursor visibility. Full-screen editors rely on these.
+        if intermediates.contains(&b'?') {
+            let enable = match action {
+                'h' => Some(true),
+                'l' => Some(false),
+                _ => None,
+            };
+            if let Some(enable) = enable {
+                let mut screen = self.screen.lock().unwrap();
+                for p in params.iter() {
+                    match p.first().copied().unwrap_or(0) {
+                        25 => screen.set_cursor_visible(enable),
+                        47 => screen.set_alt_screen(enable, false),
+                        1047 | 1049 => screen.set_alt_screen(enable, true),
+                        1048 => {
+                            if enable {
+                                screen.save_cursor();
+                            } else {
+                                screen.restore_cursor();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+        }
+
         // Device / cursor queries reply on the shell's stdin.
         match action {
             'c' => {
@@ -571,12 +704,8 @@ impl Perform for Performer {
                     6 => {
                         let screen = self.screen.lock().unwrap();
                         Some(
-                            format!(
-                                "\x1b[{};{}R",
-                                screen.cursor_row + 1,
-                                screen.cursor_col + 1
-                            )
-                            .into_bytes(),
+                            format!("\x1b[{};{}R", screen.cursor_row + 1, screen.cursor_col + 1)
+                                .into_bytes(),
                         )
                     }
                     _ => None,
@@ -664,16 +793,25 @@ impl Pty {
     pub fn spawn(shell: &str, cols: u16, rows: u16, scrollback_limit: usize) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .context("opening PTY")?;
 
         let mut cmd = CommandBuilder::new(shell);
         cmd.env("TERM", "xterm-256color");
 
         let child = pair.slave.spawn_command(cmd).context("spawning shell")?;
-        let writer: SharedWriter =
-            Arc::new(Mutex::new(pair.master.take_writer().context("taking PTY writer")?));
-        let mut reader = pair.master.try_clone_reader().context("cloning PTY reader")?;
+        let writer: SharedWriter = Arc::new(Mutex::new(
+            pair.master.take_writer().context("taking PTY writer")?,
+        ));
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .context("cloning PTY reader")?;
 
         let screen = Arc::new(Mutex::new(Screen::new(
             cols as usize,
@@ -696,7 +834,10 @@ impl Pty {
             .name("pty-reader".into())
             .spawn(move || {
                 let mut parser = Parser::new();
-                let mut performer = Performer { screen: screen_clone, writer: writer_clone };
+                let mut performer = Performer {
+                    screen: screen_clone,
+                    writer: writer_clone,
+                };
                 let mut buf = [0u8; 4096];
                 loop {
                     match reader.read(&mut buf) {
@@ -714,7 +855,13 @@ impl Pty {
             })
             .context("spawning reader thread")?;
 
-        Ok(Self { master: pair.master, _child: child, screen, writer, alive })
+        Ok(Self {
+            master: pair.master,
+            _child: child,
+            screen,
+            writer,
+            alive,
+        })
     }
 
     /// True while the child shell is still running.
@@ -753,7 +900,12 @@ impl Pty {
     /// Resizes the PTY and the local screen grid to match the current pane size.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .context("resizing PTY")?;
         self.screen
             .lock()
@@ -783,8 +935,7 @@ mod tests {
 
     fn performer() -> (Performer, Arc<Mutex<Vec<u8>>>) {
         let output = Arc::new(Mutex::new(Vec::new()));
-        let writer: SharedWriter =
-            Arc::new(Mutex::new(Box::new(SharedVec(Arc::clone(&output)))));
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(SharedVec(Arc::clone(&output)))));
         (
             Performer {
                 screen: Arc::new(Mutex::new(Screen::new(20, 4, 100))),
@@ -806,7 +957,10 @@ mod tests {
 
     fn styled_row(text: &str) -> Vec<Cell> {
         text.chars()
-            .map(|ch| Cell { ch, style: Style::default() })
+            .map(|ch| Cell {
+                ch,
+                style: Style::default(),
+            })
             .collect()
     }
 
@@ -836,6 +990,43 @@ mod tests {
         assert_eq!(screen.scroll_offset(), 2);
         screen.scroll_by(-1);
         assert_eq!(screen.scroll_offset(), 1);
+    }
+
+    #[test]
+    fn alternate_screen_restores_normal_buffer_on_exit() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        let feed = |parser: &mut Parser, performer: &mut Performer, bytes: &[u8]| {
+            for byte in bytes {
+                parser.advance(performer, *byte);
+            }
+        };
+
+        feed(&mut parser, &mut performer, b"prompt");
+        feed(&mut parser, &mut performer, b"\x1b[?1049h");
+        feed(&mut parser, &mut performer, b"editor");
+        let screen = performer.screen.lock().unwrap();
+        assert_eq!(screen.visible_lines()[0], "editor");
+        drop(screen);
+
+        feed(&mut parser, &mut performer, b"\x1b[?1049l");
+        let screen = performer.screen.lock().unwrap();
+        assert_eq!(screen.visible_lines()[0], "prompt");
+    }
+
+    #[test]
+    fn dectcem_toggles_cursor_visibility() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        for byte in b"\x1b[?25l" {
+            parser.advance(&mut performer, *byte);
+        }
+        assert!(!performer.screen.lock().unwrap().cursor_visible());
+
+        for byte in b"\x1b[?25h" {
+            parser.advance(&mut performer, *byte);
+        }
+        assert!(performer.screen.lock().unwrap().cursor_visible());
     }
 
     #[test]
