@@ -14,6 +14,19 @@ impl Rect {
 /// Height of the tab bar in pixels.
 pub const TAB_BAR_H: f32 = 28.0;
 
+/// Size of a tab indicator square in pixels. Fixed so it never scales with
+/// the terminal font size.
+pub const TAB_INDICATOR_SIZE: f32 = 16.0;
+
+/// Corner radius of a tab indicator square in pixels.
+pub const TAB_INDICATOR_RADIUS: f32 = 4.5;
+
+/// Horizontal gap between tab indicators in pixels.
+pub const TAB_INDICATOR_GAP: f32 = 10.0;
+
+/// Left padding of the tab indicator strip in pixels.
+pub const TAB_BAR_PAD: f32 = 9.0;
+
 /// Padding between a pane's border and its terminal text.
 pub const PANE_PAD: f32 = 6.0;
 

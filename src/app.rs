@@ -35,18 +35,19 @@ pub struct Tab {
     pub panes: Vec<Pane>,
     pub focused: usize,
     pub layout: Layout,
-    pub title: String,
+    /// Index into the tab indicator palette, stable for the life of the tab.
+    pub accent: usize,
 }
 
 impl Tab {
-    pub fn new(config: &Config, index: usize) -> Result<Self> {
+    pub fn new(config: &Config, accent: usize) -> Result<Self> {
         let mut panes = Vec::new();
         panes.push(Pane::new(config)?);
         Ok(Self {
             panes,
             focused: 0,
             layout: Layout::Single,
-            title: format!("Tab {}", index + 1),
+            accent,
         })
     }
 
@@ -96,12 +97,19 @@ pub struct App {
     pub active_tab: usize,
     pub config: Config,
     pub running: bool,
+    next_accent: usize,
 }
 
 impl App {
     pub fn new(config: Config) -> Result<Self> {
         let first = Tab::new(&config, 0)?;
-        Ok(Self { tabs: vec![first], active_tab: 0, config, running: true })
+        Ok(Self {
+            tabs: vec![first],
+            active_tab: 0,
+            config,
+            running: true,
+            next_accent: 1,
+        })
     }
 
     pub fn active_tab(&self) -> &Tab {
@@ -113,8 +121,9 @@ impl App {
     }
 
     pub fn new_tab(&mut self) -> Result<()> {
-        let idx = self.tabs.len();
-        self.tabs.push(Tab::new(&self.config, idx)?);
+        let accent = self.next_accent;
+        self.next_accent = self.next_accent.wrapping_add(1);
+        self.tabs.push(Tab::new(&self.config, accent)?);
         self.active_tab = self.tabs.len() - 1;
         Ok(())
     }

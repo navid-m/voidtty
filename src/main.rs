@@ -12,7 +12,10 @@ use glfw::{Context as _, GlfwReceiver, OpenGlProfileHint, WindowEvent, WindowHin
 use app::App;
 use config::Config;
 use renderer::Renderer;
-use ui::{PANE_PAD, TAB_BAR_H, pane_rects, text_cols, text_rows};
+use ui::{
+    PANE_PAD, TAB_BAR_H, TAB_BAR_PAD, TAB_INDICATOR_GAP, TAB_INDICATOR_RADIUS,
+    TAB_INDICATOR_SIZE, pane_rects, text_cols, text_rows,
+};
 
 const FALLBACK_FONT: &[u8] = include_bytes!("../assets/font.ttf");
 
@@ -110,6 +113,22 @@ fn process_events(
     Ok(())
 }
 
+/// Dark blue / red / black-leaning palette used for tab indicators.
+const TAB_COLORS: &[(f32, f32, f32)] = &[
+    (0.19, 0.30, 0.55),
+    (0.55, 0.17, 0.22),
+    (0.20, 0.21, 0.27),
+    (0.30, 0.24, 0.47),
+    (0.43, 0.12, 0.17),
+    (0.13, 0.20, 0.36),
+];
+
+fn tab_color(accent: usize, active: bool) -> (f32, f32, f32) {
+    let (r, g, b) = TAB_COLORS[accent % TAB_COLORS.len()];
+    let k = if active { 1.25 } else { 0.72 };
+    ((r * k).min(1.0), (g * k).min(1.0), (b * k).min(1.0))
+}
+
 fn draw_frame(renderer: &Renderer, app: &App) {
     let opacity = app.config.opacity;
     // Dark background respecting transparency.
@@ -118,49 +137,60 @@ fn draw_frame(renderer: &Renderer, app: &App) {
     let tab = app.active_tab();
     let rects = pane_rects(renderer.win_w, renderer.win_h, tab.panes.len());
 
-    // Tab bar background.
+    // Tab bar background with a subtle dark-blue separator below it.
     renderer.draw_rect(
         0.0,
         0.0,
         renderer.win_w,
         TAB_BAR_H,
+        0.04,
+        0.045,
+        0.07,
+        opacity,
+    );
+    renderer.draw_rect(
+        0.0,
+        TAB_BAR_H - 1.0,
+        renderer.win_w,
+        1.0,
         0.10,
-        0.10,
-        0.14,
+        0.13,
+        0.20,
         opacity,
     );
 
-    // Tab labels.
-    let mut tab_x = 4.0f32;
+    // Fixed-size tab indicators: independent of the terminal font size.
+    let y = (TAB_BAR_H - TAB_INDICATOR_SIZE) * 0.5;
     for (i, t) in app.tabs.iter().enumerate() {
         let active = i == app.active_tab;
-        let (r, g, b) = if active {
-            (1.0, 0.85, 0.2)
-        } else {
-            (0.5, 0.5, 0.55)
-        };
+        let x = TAB_BAR_PAD + i as f32 * (TAB_INDICATOR_SIZE + TAB_INDICATOR_GAP);
+        let (r, g, b) = tab_color(t.accent, active);
+
         if active {
-            renderer.draw_rect(
-                tab_x - 4.0,
-                0.0,
-                t.title.len() as f32 * renderer.cell_w() + 16.0,
-                TAB_BAR_H,
-                0.18,
-                0.18,
-                0.24,
-                opacity,
+            renderer.draw_round_rect(
+                x - 3.0,
+                y - 3.0,
+                TAB_INDICATOR_SIZE + 6.0,
+                TAB_INDICATOR_SIZE + 6.0,
+                TAB_INDICATOR_RADIUS + 3.0,
+                r,
+                g,
+                b,
+                0.20 * opacity,
             );
         }
-        renderer.draw_text(
-            &t.title,
-            tab_x,
-            (TAB_BAR_H - renderer.line_height()) * 0.5,
+
+        renderer.draw_round_rect(
+            x,
+            y,
+            TAB_INDICATOR_SIZE,
+            TAB_INDICATOR_SIZE,
+            TAB_INDICATOR_RADIUS,
             r,
             g,
             b,
-            1.0,
+            if active { opacity } else { 0.85 * opacity },
         );
-        tab_x += t.title.len() as f32 * renderer.cell_w() + 20.0;
     }
 
     // Pane borders + content.

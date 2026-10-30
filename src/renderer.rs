@@ -185,6 +185,42 @@ out vec4 fragColor;
 void main() { fragColor = vCol; }
 "#;
 
+const VS_ROUND: &str = r#"
+#version 330 core
+layout(location=0) in vec2 aPos;
+layout(location=1) in vec2 aLocal;
+layout(location=2) in vec4 aCol;
+out vec2 vLocal;
+out vec4 vCol;
+uniform vec2 uRes;
+void main() {
+    vec2 ndc = aPos / uRes * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    vLocal = aLocal;
+    vCol = aCol;
+}
+"#;
+
+const FS_ROUND: &str = r#"
+#version 330 core
+in vec2 vLocal;
+in vec4 vCol;
+out vec4 fragColor;
+uniform vec2 uHalfSize;
+uniform float uRadius;
+float sdRoundBox(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+void main() {
+    float d = sdRoundBox(vLocal, uHalfSize, uRadius);
+    float aa = max(fwidth(d), 0.0001);
+    float coverage = 1.0 - smoothstep(-aa, aa, d);
+    fragColor = vec4(vCol.rgb, vCol.a * coverage);
+}
+"#;
+
 fn compile_shader(src: &str, kind: GLenum) -> Result<GLuint> {
     unsafe {
         let id = gl::CreateShader(kind);
@@ -233,15 +269,21 @@ struct TV { x: f32, y: f32, u: f32, v: f32, r: f32, g: f32, b: f32, a: f32 }
 #[repr(C)]
 struct RV { x: f32, y: f32, r: f32, g: f32, b: f32, a: f32 }
 
+#[repr(C)]
+struct R2V { x: f32, y: f32, lx: f32, ly: f32, r: f32, g: f32, b: f32, a: f32 }
+
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
     prog_text: GLuint,
     prog_rect: GLuint,
+    prog_round: GLuint,
     vao_text:  GLuint,
     vbo_text:  GLuint,
     vao_rect:  GLuint,
     vbo_rect:  GLuint,
+    vao_round: GLuint,
+    vbo_round: GLuint,
     pub atlas: GlyphAtlas,
     pub win_w: f32,
     pub win_h: f32,
@@ -269,12 +311,19 @@ impl Renderer {
             compile_shader(VS_RECT, gl::VERTEX_SHADER)?,
             compile_shader(FS_RECT, gl::FRAGMENT_SHADER)?,
         )?;
+        let prog_round = link_program(
+            compile_shader(VS_ROUND, gl::VERTEX_SHADER)?,
+            compile_shader(FS_ROUND, gl::FRAGMENT_SHADER)?,
+        )?;
 
         let (vao_text, vbo_text) = unsafe { make_vao::<TV>(
             &[(0, 2, 0), (1, 2, 8), (2, 4, 16)],
         )};
         let (vao_rect, vbo_rect) = unsafe { make_vao::<RV>(
             &[(0, 2, 0), (1, 4, 8)],
+        )};
+        let (vao_round, vbo_round) = unsafe { make_vao::<R2V>(
+            &[(0, 2, 0), (1, 2, 8), (2, 4, 16)],
         )};
 
         unsafe {
@@ -284,9 +333,10 @@ impl Renderer {
         }
 
         Ok(Self {
-            prog_text, prog_rect,
+            prog_text, prog_rect, prog_round,
             vao_text, vbo_text,
             vao_rect, vbo_rect,
+            vao_round, vbo_round,
             atlas,
             win_w: win_w as f32,
             win_h: win_h as f32,
@@ -334,6 +384,33 @@ impl Renderer {
             gl::UseProgram(self.prog_rect);
             uniform2f(self.prog_rect, "uRes", self.win_w, self.win_h);
             upload_and_draw(self.vao_rect, self.vbo_rect, &verts, 6);
+        }
+    }
+
+    /// Draws a filled rounded rectangle using a signed-distance fragment shader.
+    pub fn draw_round_rect(
+        &self,
+        x: f32, y: f32, w: f32, h: f32, radius: f32,
+        r: f32, g: f32, b: f32, a: f32,
+    ) {
+        let radius = radius.clamp(0.0, w.min(h) * 0.5);
+        let (x1, y1) = (x + w, y + h);
+        let (cx, cy) = (x + w * 0.5, y + h * 0.5);
+        let mk = |px: f32, py: f32| R2V {
+            x: px, y: py,
+            lx: px - cx, ly: py - cy,
+            r, g, b, a,
+        };
+        let verts = [
+            mk(x, y), mk(x1, y), mk(x, y1),
+            mk(x1, y), mk(x1, y1), mk(x, y1),
+        ];
+        unsafe {
+            gl::UseProgram(self.prog_round);
+            uniform2f(self.prog_round, "uRes", self.win_w, self.win_h);
+            uniform2f(self.prog_round, "uHalfSize", w * 0.5, h * 0.5);
+            uniform1f(self.prog_round, "uRadius", radius);
+            upload_and_draw(self.vao_round, self.vbo_round, &verts, 6);
         }
     }
 
@@ -421,4 +498,10 @@ unsafe fn uniform1i(prog: GLuint, name: &str, v: i32) { unsafe {
     let cname = CString::new(name).unwrap();
     let loc = gl::GetUniformLocation(prog, cname.as_ptr());
     gl::Uniform1i(loc, v);
+}}
+
+unsafe fn uniform1f(prog: GLuint, name: &str, v: f32) { unsafe {
+    let cname = CString::new(name).unwrap();
+    let loc = gl::GetUniformLocation(prog, cname.as_ptr());
+    gl::Uniform1f(loc, v);
 }}
