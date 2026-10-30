@@ -6,6 +6,7 @@ mod renderer;
 mod terminal;
 mod ui;
 
+use std::env;
 use anyhow::{Context, Result};
 use glfw::{Context as _, GlfwReceiver, OpenGlProfileHint, WindowEvent, WindowHint, WindowMode};
 
@@ -18,6 +19,14 @@ use ui::{Rect, UiMetrics, layout_rects, pane_content, text_cols, text_rows};
 const FALLBACK_FONT: &[u8] = include_bytes!("../assets/font.ttf");
 
 fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    for arg in args {
+        if arg == "--about" || arg == "-a" || arg == "-v" || arg == "--version" {
+            eprintln!("voidtty v{}\nBy Navid Momtahen (C) - 2026", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+    }
+
     let config = Config::load()?;
 
     let font = load_font(&config);
