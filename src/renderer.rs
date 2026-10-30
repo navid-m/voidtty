@@ -366,7 +366,7 @@ impl Renderer {
 
 /// Creates a VAO+VBO pair with the given attribute layout.
 /// Each entry is `(location, component_count, byte_offset)`.
-unsafe fn make_vao<T>(attribs: &[(u32, i32, usize)]) -> (GLuint, GLuint) {
+unsafe fn make_vao<T>(attribs: &[(u32, i32, usize)]) -> (GLuint, GLuint) { unsafe {
     let mut vao = 0u32; let mut vbo = 0u32;
     gl::GenVertexArrays(1, &mut vao);
     gl::GenBuffers(1, &mut vbo);
@@ -378,9 +378,9 @@ unsafe fn make_vao<T>(attribs: &[(u32, i32, usize)]) -> (GLuint, GLuint) {
         gl::EnableVertexAttribArray(loc);
     }
     (vao, vbo)
-}
+}}
 
-unsafe fn upload_and_draw<T>(vao: GLuint, vbo: GLuint, data: &[T], count: i32) {
+unsafe fn upload_and_draw<T>(vao: GLuint, vbo: GLuint, data: &[T], count: i32) { unsafe {
     gl::BindVertexArray(vao);
     gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
     gl::BufferData(
@@ -390,16 +390,16 @@ unsafe fn upload_and_draw<T>(vao: GLuint, vbo: GLuint, data: &[T], count: i32) {
         gl::DYNAMIC_DRAW,
     );
     gl::DrawArrays(gl::TRIANGLES, 0, count);
-}
+}}
 
-unsafe fn uniform2f(prog: GLuint, name: &str, x: f32, y: f32) {
+unsafe fn uniform2f(prog: GLuint, name: &str, x: f32, y: f32) { unsafe {
     let cname = CString::new(name).unwrap();
     let loc = gl::GetUniformLocation(prog, cname.as_ptr());
     gl::Uniform2f(loc, x, y);
-}
+}}
 
-unsafe fn uniform1i(prog: GLuint, name: &str, v: i32) {
+unsafe fn uniform1i(prog: GLuint, name: &str, v: i32) { unsafe {
     let cname = CString::new(name).unwrap();
     let loc = gl::GetUniformLocation(prog, cname.as_ptr());
     gl::Uniform1i(loc, v);
-}
+}}
