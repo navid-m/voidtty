@@ -6,9 +6,9 @@ mod renderer;
 mod terminal;
 mod ui;
 
-use std::env;
 use anyhow::{Context, Result};
 use glfw::{Context as _, GlfwReceiver, OpenGlProfileHint, WindowEvent, WindowHint, WindowMode};
+use std::env;
 
 use app::App;
 use config::Config;
@@ -22,7 +22,11 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     for arg in args {
         if arg == "--about" || arg == "-a" || arg == "-v" || arg == "--version" {
-            eprintln!("voidtty v{}\nBy Navid Momtahen (C) - 2026", env!("CARGO_PKG_VERSION"));
+            eprintln!(
+                "voidtty v{} ({})\nBy Navid Momtahen (C) - 2026",
+                env!("CARGO_PKG_VERSION"),
+                env!("VOIDTTY_GIT_COMMIT")
+            );
             return Ok(());
         }
     }

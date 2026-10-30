@@ -85,17 +85,6 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
         return Ok(true);
     }
 
-    if ctrl && key == Key::W {
-        app.close_tab();
-        return Ok(true);
-    }
-
-    // Ctrl+T opens a new tab in whichever pane is focused.
-    if ctrl && key == Key::T {
-        app.new_tab()?;
-        return Ok(true);
-    }
-
     let bytes: Vec<u8> = if ctrl {
         match key {
             Key::A => vec![0x01],
@@ -120,6 +109,7 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
             Key::T => vec![0x14],
             Key::U => vec![0x15],
             Key::V => vec![0x16],
+            Key::W => vec![0x17],
             Key::X => vec![0x18],
             Key::Y => vec![0x19],
             Key::Z => vec![0x1a],
