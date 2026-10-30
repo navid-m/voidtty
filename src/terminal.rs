@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::{
     io::{ErrorKind, Read, Write},
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
     thread,
 };
@@ -803,6 +803,9 @@ impl Pty {
 
         let mut cmd = CommandBuilder::new(shell);
         cmd.env("TERM", "xterm-256color");
+        if let Ok(cwd) = std::env::current_dir() {
+            cmd.cwd(cwd);
+        }
 
         let child = pair.slave.spawn_command(cmd).context("spawning shell")?;
         let writer: SharedWriter = Arc::new(Mutex::new(
