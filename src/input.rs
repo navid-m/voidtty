@@ -1,7 +1,7 @@
 use anyhow::Result;
 use glfw::{Action, Key, Modifiers, WindowEvent};
 
-use crate::app::App;
+use crate::app::{App, SplitDir};
 
 /// Processes one GLFW window event. Returns `true` if consumed as a shortcut.
 pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
@@ -28,16 +28,13 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
 
     if ctrl_shift {
         match key {
+            Key::E => { app.split(SplitDir::Horizontal)?; return Ok(true); }
+            Key::O => { app.split(SplitDir::Vertical)?; return Ok(true); }
             Key::T => { app.new_tab()?; return Ok(true); }
             Key::W => { app.close_tab(); return Ok(true); }
             Key::Right => { app.next_tab(); return Ok(true); }
             Key::Left  => { app.prev_tab(); return Ok(true); }
-            Key::D => {
-                let config = app.config.clone();
-                app.active_tab_mut().add_pane(&config)?;
-                return Ok(true);
-            }
-            Key::X => { app.active_tab_mut().close_focused_pane(); return Ok(true); }
+            Key::X => { app.close_focused_pane(); return Ok(true); }
             Key::Tab => { app.prev_tab(); return Ok(true); }
             Key::Q => { app.running = false; return Ok(true); }
             _ => {}
@@ -51,6 +48,12 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
 
     if ctrl && key == Key::W {
         app.close_tab();
+        return Ok(true);
+    }
+
+    // Ctrl+T opens a new tab in whichever pane is focused.
+    if ctrl && key == Key::T {
+        app.new_tab()?;
         return Ok(true);
     }
 
@@ -75,7 +78,7 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
     };
 
     if !bytes.is_empty() {
-        app.active_tab_mut().focused_pane_mut().pty.write(&bytes)?;
+        app.active_pane_mut().active_mut().pty.write(&bytes)?;
     }
     Ok(false)
 }
@@ -84,7 +87,7 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
 pub fn handle_char(c: char, app: &mut App) -> Result<()> {
     let mut buf = [0u8; 4];
     let s = c.encode_utf8(&mut buf);
-    app.active_tab_mut().focused_pane_mut().pty.write(s.as_bytes())
+    app.active_pane_mut().active_mut().pty.write(s.as_bytes())
 }
 
 fn key_to_bytes(key: Key, mods: Modifiers) -> Vec<u8> {

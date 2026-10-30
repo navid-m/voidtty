@@ -13,7 +13,7 @@ use app::App;
 use config::Config;
 use renderer::Renderer;
 use terminal::{Color, Style};
-use ui::{Rect, UiMetrics, pane_rects, text_cols, text_rows};
+use ui::{Rect, UiMetrics, layout_rects, pane_content, text_cols, text_rows};
 
 const FALLBACK_FONT: &[u8] = include_bytes!("../assets/font.ttf");
 
@@ -82,6 +82,10 @@ fn main() -> Result<()> {
             renderer.set_font_size(app.config.font_size)?;
             ui = ui.with_tab_bar_height(renderer.line_height());
             resize_ptys(&mut app, &renderer, ui);
+            app.needs_resize = false;
+        } else if app.needs_resize {
+            resize_ptys(&mut app, &renderer, ui);
+            app.needs_resize = false;
         }
         draw_frame(&mut renderer, &app, ui)?;
         window.swap_buffers();
@@ -108,17 +112,12 @@ fn process_events(
             }
             WindowEvent::Scroll(_, y) => {
                 let (mx, my) = window.get_cursor_pos();
-                let rects = pane_rects(
-                    renderer.win_w,
-                    renderer.win_h,
-                    app.active_tab().panes.len(),
-                    ui.tab_bar_h,
-                );
-                let index = ui::hit_pane(mx as f32 * ui.scale, my as f32 * ui.scale, &rects)
-                    .unwrap_or(app.active_tab().focused);
-                let tab = app.active_tab_mut();
-                if let Some(pane) = tab.panes.get(index) {
-                    pane.pty
+                let rects = pane_layout(app, renderer);
+                let id = ui::hit_pane(mx as f32 * ui.scale, my as f32 * ui.scale, &rects)
+                    .unwrap_or(app.focused);
+                if let Some(pane) = app.pane_mut(id) {
+                    pane.active_mut()
+                        .pty
                         .screen
                         .lock()
                         .unwrap()
@@ -126,32 +125,25 @@ fn process_events(
                 }
             }
             WindowEvent::CursorPos(x, y) => {
-                if let Some((tab_idx, pane_idx)) = app.scroll_drag {
-                    if app
-                        .tabs
-                        .get(tab_idx)
-                        .is_some_and(|t| pane_idx < t.panes.len())
-                    {
-                        let rects = pane_rects(
-                            renderer.win_w,
-                            renderer.win_h,
-                            app.tabs[tab_idx].panes.len(),
-                            ui.tab_bar_h,
-                        );
-                        let rect = rects[pane_idx];
-                        let pane = &app.tabs[tab_idx].panes[pane_idx];
-                        let (max, rows) = {
-                            let screen = pane.pty.screen.lock().unwrap();
-                            (screen.max_scroll(), screen.rows())
-                        };
-                        if let Some(geom) = scrollbar_geometry(&rect, ui, max, rows) {
-                            let offset =
-                                scrollbar_offset_at(&geom, max, y as f32 * ui.scale);
-                            pane.pty
-                                .screen
-                                .lock()
-                                .unwrap()
-                                .set_scroll_offset(offset);
+                if let Some(id) = app.scroll_drag {
+                    let rects = pane_layout(app, renderer);
+                    if let Some((_, rect)) = rects.iter().find(|(pane_id, _)| *pane_id == id) {
+                        let content = pane_content(*rect, ui.tab_bar_h);
+                        if let Some(pane) = app.pane(id) {
+                            let (max, rows) = {
+                                let screen = pane.active().pty.screen.lock().unwrap();
+                                (screen.max_scroll(), screen.rows())
+                            };
+                            if let Some(geom) = scrollbar_geometry(&content, ui, max, rows) {
+                                let offset =
+                                    scrollbar_offset_at(&geom, max, y as f32 * ui.scale);
+                                pane.active()
+                                    .pty
+                                    .screen
+                                    .lock()
+                                    .unwrap()
+                                    .set_scroll_offset(offset);
+                            }
                         }
                     }
                 }
@@ -164,21 +156,17 @@ fn process_events(
                 let (mx, my) = window.get_cursor_pos();
                 let mx = mx as f32 * ui.scale;
                 let my = my as f32 * ui.scale;
-                let active = app.active_tab;
-                let rects = pane_rects(
-                    renderer.win_w,
-                    renderer.win_h,
-                    app.tabs[active].panes.len(),
-                    ui.tab_bar_h,
-                );
+                let rects = pane_layout(app, renderer);
 
                 let mut grabbed_scrollbar = false;
-                for (idx, rect) in rects.iter().enumerate() {
+                for (id, rect) in &rects {
+                    let content = pane_content(*rect, ui.tab_bar_h);
+                    let Some(pane) = app.pane(*id) else { continue };
                     let (max, rows) = {
-                        let screen = app.tabs[active].panes[idx].pty.screen.lock().unwrap();
+                        let screen = pane.active().pty.screen.lock().unwrap();
                         (screen.max_scroll(), screen.rows())
                     };
-                    let Some(geom) = scrollbar_geometry(rect, ui, max, rows) else {
+                    let Some(geom) = scrollbar_geometry(&content, ui, max, rows) else {
                         continue;
                     };
                     if mx >= geom.x
@@ -187,23 +175,23 @@ fn process_events(
                         && my < geom.y + geom.track_h
                     {
                         let offset = scrollbar_offset_at(&geom, max, my);
-                        app.tabs[active].focused = idx;
-                        app.tabs[active].panes[idx]
+                        pane.active()
                             .pty
                             .screen
                             .lock()
                             .unwrap()
                             .set_scroll_offset(offset);
-                        app.scroll_drag = Some((active, idx));
+                        app.focused = *id;
+                        app.scroll_drag = Some(*id);
                         grabbed_scrollbar = true;
                         break;
                     }
                 }
 
-                if !grabbed_scrollbar {
-                    if let Some(idx) = ui::hit_pane(mx, my, &rects) {
-                        app.tabs[active].focused = idx;
-                    }
+                if !grabbed_scrollbar
+                    && let Some(id) = ui::hit_pane(mx, my, &rects)
+                {
+                    app.focused = id;
                 }
             }
             ev => {
@@ -212,6 +200,15 @@ fn process_events(
         }
     }
     Ok(())
+}
+
+/// Computes the current pane rectangles from the split tree.
+fn pane_layout(app: &App, renderer: &Renderer) -> Vec<(usize, Rect)> {
+    let area = Rect::new(0.0, 0.0, renderer.win_w, renderer.win_h);
+    app.layout
+        .as_ref()
+        .map(|layout| layout_rects(layout, area))
+        .unwrap_or_default()
 }
 
 /// Dark blue / red / black-leaning palette used for tab indicators.
@@ -336,40 +333,150 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
     // Black background respecting transparency.
     renderer.clear(0.0, 0.0, 0.0, opacity);
 
-    let tab = app.active_tab();
-    let rects = pane_rects(
-        renderer.win_w,
-        renderer.win_h,
-        tab.panes.len(),
-        ui.tab_bar_h,
-    );
+    for (id, rect) in pane_layout(app, renderer) {
+        let Some(pane) = app.pane(id) else { continue };
+        draw_pane(renderer, pane, rect, id == app.focused, ui, opacity)?;
+    }
 
-    // Integrated tab strip: same black background as the terminal, with a
-    // Unicode status dot and the terminal title for each tab.
+    Ok(())
+}
+
+fn draw_pane(
+    renderer: &mut Renderer,
+    pane: &app::Pane,
+    rect: Rect,
+    focused: bool,
+    ui: UiMetrics,
+    opacity: f32,
+) -> Result<()> {
+    // Pane background.
+    renderer.draw_rect(rect.x, rect.y, rect.w, rect.h, 0.0, 0.0, 0.0, opacity);
+
+    // Border highlight for the focused pane.
+    if focused {
+        let t = 1.5 * ui.scale;
+        renderer.draw_rect(rect.x, rect.y, rect.w, t, 0.3, 0.7, 1.0, 0.8);
+        renderer.draw_rect(rect.x, rect.y, t, rect.h, 0.3, 0.7, 1.0, 0.8);
+        renderer.draw_rect(rect.x, rect.y + rect.h - t, rect.w, t, 0.3, 0.7, 1.0, 0.8);
+        renderer.draw_rect(rect.x + rect.w - t, rect.y, t, rect.h, 0.3, 0.7, 1.0, 0.8);
+    } else {
+        let t = ui.scale;
+        let c = 0.2f32;
+        renderer.draw_rect(rect.x, rect.y, rect.w, t, c, c, c, 0.6);
+        renderer.draw_rect(rect.x, rect.y, t, rect.h, c, c, c, 0.6);
+    }
+
+    draw_tab_bar(renderer, pane, rect, ui, opacity)?;
+
+    let content = pane_content(rect, ui.tab_bar_h);
+    let tab = pane.active();
+    let screen = tab.pty.screen.lock().unwrap();
+    let cw = renderer.cell_w();
+    let lh = renderer.line_height();
+    let (cursor_row, cursor_col) = screen.cursor();
+    let show_cursor = focused && screen.scroll_offset() == 0;
+
+    for (row, cells) in screen.display_rows().enumerate() {
+        let y = content.y + ui.pane_pad + row as f32 * lh;
+        let cursor_here = show_cursor && row == cursor_row;
+        let cursor_cell = cursor_here.then(|| cursor_col.min(cells.len().saturating_sub(1)));
+
+        let mut last = cells
+            .iter()
+            .rposition(|c| c.ch != ' ' || c.style != Style::default())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if let Some(col) = cursor_cell {
+            last = last.max(col + 1);
+        }
+        if last == 0 {
+            continue;
+        }
+
+        let mut colors = Vec::with_capacity(last);
+        for (col, cell) in cells[..last].iter().enumerate() {
+            let style = if Some(col) == cursor_cell {
+                // Solid, non-blinking block cursor.
+                Style {
+                    fg: Color::Default,
+                    bg: Color::Default,
+                    bold: false,
+                    underline: false,
+                    reverse: true,
+                }
+            } else {
+                cell.style
+            };
+            let (fg, bg, fill) = cell_colors(style);
+            let x = content.x + ui.pane_pad + col as f32 * cw;
+            if fill {
+                renderer.draw_rect(x, y, cw, lh, bg.0, bg.1, bg.2, opacity);
+            }
+            if style.underline {
+                renderer.draw_rect(x, y + lh - 1.5, cw, 1.0, fg.0, fg.1, fg.2, opacity);
+            }
+            colors.push(fg);
+        }
+
+        let text: String = cells[..last].iter().map(|c| c.ch).collect();
+        renderer.draw_text_styled(&text, &colors, content.x + ui.pane_pad, y, 1.0)?;
+    }
+
+    // Vertical scrollbar, drawn inside the pane's right padding.
+    let max_scroll = screen.max_scroll();
+    if let Some(geom) = scrollbar_geometry(&content, ui, max_scroll, screen.rows()) {
+        let radius = geom.w * 0.5;
+        let frac = screen.scroll_offset() as f32 / max_scroll as f32;
+        let thumb_y = geom.y + (geom.track_h - geom.thumb_h) * (1.0 - frac);
+
+        renderer.draw_round_rect(
+            geom.x, geom.y, geom.w, geom.track_h, radius,
+            1.0, 1.0, 1.0, 0.05 * opacity,
+        );
+        renderer.draw_round_rect(
+            geom.x, thumb_y, geom.w, geom.thumb_h, radius,
+            0.55, 0.60, 0.70,
+            if focused { 0.55 } else { 0.35 } * opacity,
+        );
+    }
+
+    Ok(())
+}
+
+/// Draws one pane's own tab strip along the top of its rectangle.
+fn draw_tab_bar(
+    renderer: &mut Renderer,
+    pane: &app::Pane,
+    rect: Rect,
+    ui: UiMetrics,
+    opacity: f32,
+) -> Result<()> {
     let tab_cw = renderer.cell_w();
     let tab_lh = renderer.line_height();
-    let tab_text_y = (ui.tab_bar_h - tab_lh) * 0.5;
-    let mut tab_x = ui.tab_bar_pad;
+    let tab_text_y = rect.y + (ui.tab_bar_h - tab_lh) * 0.5;
+    let right = rect.x + rect.w;
+    let mut tab_x = rect.x + ui.tab_bar_pad;
 
-    for (i, t) in app.tabs.iter().enumerate() {
-        let active = i == app.active_tab;
-        let title = t
-            .panes
-            .get(t.focused)
-            .or_else(|| t.panes.first())
-            .map(|pane| pane.pty.screen.lock().unwrap().title().to_owned())
-            .unwrap_or_else(|| "Terminal".to_owned());
+    for (i, t) in pane.tabs.iter().enumerate() {
+        if tab_x >= right {
+            break;
+        }
+        let active = i == pane.active_tab;
+        let title = t.pty.screen.lock().unwrap().title().to_owned();
         let title: String = title.chars().take(28).collect();
         let label = format!("{} {}", if active { "●" } else { "○" }, title);
         let cell_count = label.chars().count();
         let width = cell_count as f32 * tab_cw;
+        if tab_x + width > right {
+            break;
+        }
         let (r, g, b) = tab_color(t.accent, active);
 
         if active {
             let bg = ui.tab_bar_pad * 0.4;
             renderer.draw_round_rect(
                 tab_x - bg,
-                0.0,
+                rect.y,
                 width + bg * 2.0,
                 ui.tab_bar_h,
                 4.0 * ui.scale,
@@ -380,7 +487,7 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
             );
             renderer.draw_rect(
                 tab_x,
-                ui.tab_bar_h - ui.scale,
+                rect.y + ui.tab_bar_h - ui.scale,
                 width,
                 ui.scale,
                 r,
@@ -411,99 +518,6 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
         tab_x += width + ui.tab_gap;
     }
 
-    // Pane borders + content.
-    for (i, (pane, rect)) in tab.panes.iter().zip(rects.iter()).enumerate() {
-        let focused = i == tab.focused;
-
-        // Pane background.
-        renderer.draw_rect(rect.x, rect.y, rect.w, rect.h, 0.0, 0.0, 0.0, opacity);
-
-        // Border highlight for focused pane.
-        if focused {
-            let t = 1.5 * ui.scale;
-            renderer.draw_rect(rect.x, rect.y, rect.w, t, 0.3, 0.7, 1.0, 0.8);
-            renderer.draw_rect(rect.x, rect.y, t, rect.h, 0.3, 0.7, 1.0, 0.8);
-            renderer.draw_rect(rect.x, rect.y + rect.h - t, rect.w, t, 0.3, 0.7, 1.0, 0.8);
-            renderer.draw_rect(rect.x + rect.w - t, rect.y, t, rect.h, 0.3, 0.7, 1.0, 0.8);
-        } else {
-            let t = ui.scale;
-            let c = 0.2f32;
-            renderer.draw_rect(rect.x, rect.y, rect.w, t, c, c, c, 0.6);
-            renderer.draw_rect(rect.x, rect.y, t, rect.h, c, c, c, 0.6);
-        }
-
-        // Terminal cells: backgrounds first, then shaped text with per-cell color.
-        let screen = pane.pty.screen.lock().unwrap();
-        let cw = renderer.cell_w();
-        let lh = renderer.line_height();
-        let (cursor_row, cursor_col) = screen.cursor();
-        let show_cursor = focused && screen.scroll_offset() == 0;
-
-        for (row, cells) in screen.display_rows().enumerate() {
-            let y = rect.y + ui.pane_pad + row as f32 * lh;
-            let cursor_here = show_cursor && row == cursor_row;
-            let cursor_cell = cursor_here.then(|| cursor_col.min(cells.len().saturating_sub(1)));
-
-            let mut last = cells
-                .iter()
-                .rposition(|c| c.ch != ' ' || c.style != Style::default())
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            if let Some(col) = cursor_cell {
-                last = last.max(col + 1);
-            }
-            if last == 0 {
-                continue;
-            }
-
-            let mut colors = Vec::with_capacity(last);
-            for (col, cell) in cells[..last].iter().enumerate() {
-                let style = if Some(col) == cursor_cell {
-                    // Solid, non-blinking block cursor.
-                    Style {
-                        fg: Color::Default,
-                        bg: Color::Default,
-                        bold: false,
-                        underline: false,
-                        reverse: true,
-                    }
-                } else {
-                    cell.style
-                };
-                let (fg, bg, fill) = cell_colors(style);
-                let x = rect.x + ui.pane_pad + col as f32 * cw;
-                if fill {
-                    renderer.draw_rect(x, y, cw, lh, bg.0, bg.1, bg.2, opacity);
-                }
-                if style.underline {
-                    renderer.draw_rect(x, y + lh - 1.5, cw, 1.0, fg.0, fg.1, fg.2, opacity);
-                }
-                colors.push(fg);
-            }
-
-            let text: String = cells[..last].iter().map(|c| c.ch).collect();
-            renderer.draw_text_styled(&text, &colors, rect.x + ui.pane_pad, y, 1.0)?;
-        }
-
-        // Vertical scrollbar, drawn inside the pane's right padding.
-        let max_scroll = screen.max_scroll();
-        if let Some(geom) = scrollbar_geometry(rect, ui, max_scroll, screen.rows()) {
-            let radius = geom.w * 0.5;
-            let frac = screen.scroll_offset() as f32 / max_scroll as f32;
-            let thumb_y = geom.y + (geom.track_h - geom.thumb_h) * (1.0 - frac);
-
-            renderer.draw_round_rect(
-                geom.x, geom.y, geom.w, geom.track_h, radius,
-                1.0, 1.0, 1.0, 0.05 * opacity,
-            );
-            renderer.draw_round_rect(
-                geom.x, thumb_y, geom.w, geom.thumb_h, radius,
-                0.55, 0.60, 0.70,
-                if focused { 0.55 } else { 0.35 } * opacity,
-            );
-        }
-    }
-
     Ok(())
 }
 
@@ -511,17 +525,14 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
 fn resize_ptys(app: &mut App, renderer: &Renderer, ui: UiMetrics) {
     let cw = renderer.cell_w();
     let lh = renderer.line_height();
-    for tab in app.tabs.iter_mut() {
-        let rects = pane_rects(
-            renderer.win_w,
-            renderer.win_h,
-            tab.panes.len(),
-            ui.tab_bar_h,
-        );
-        for (pane, rect) in tab.panes.iter_mut().zip(rects.iter()) {
-            let cols = text_cols(rect.w, cw, ui.pane_pad, ui.scrollbar_gutter).max(1) as u16;
-            let rows = text_rows(rect.h, lh, ui.pane_pad).max(1) as u16;
-            let _ = pane.pty.resize(cols, rows);
+    for (id, rect) in pane_layout(app, renderer) {
+        let content = pane_content(rect, ui.tab_bar_h);
+        let cols = text_cols(content.w, cw, ui.pane_pad, ui.scrollbar_gutter).max(1) as u16;
+        let rows = text_rows(content.h, lh, ui.pane_pad).max(1) as u16;
+        if let Some(pane) = app.pane(id) {
+            for tab in &pane.tabs {
+                let _ = tab.pty.resize(cols, rows);
+            }
         }
     }
 }

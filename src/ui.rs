@@ -1,3 +1,5 @@
+use crate::app::{LayoutNode, SplitDir};
+
 /// Axis-aligned rectangle in pixel coordinates (top-left origin).
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
@@ -69,39 +71,58 @@ pub fn text_rows(rect_h: f32, line_height: f32, pane_pad: f32) -> usize {
     ((rect_h - pane_pad * 2.0).max(0.0) / line_height).floor() as usize
 }
 
-/// Splits the content area (below the tab bar) into pane rects for the given
-/// number of panes. Supports 1, 2 (horizontal split), or 4 (2×2 grid).
-pub fn pane_rects(win_w: f32, win_h: f32, pane_count: usize, tab_bar_h: f32) -> Vec<Rect> {
-    let content_y = tab_bar_h;
-    let content_h = win_h - tab_bar_h;
-
-    match pane_count {
-        1 => vec![Rect::new(0.0, content_y, win_w, content_h)],
-        2 => vec![
-            Rect::new(0.0,       content_y, win_w / 2.0, content_h),
-            Rect::new(win_w / 2.0, content_y, win_w / 2.0, content_h),
-        ],
-        3 => vec![
-            Rect::new(0.0,       content_y, win_w / 2.0, content_h),
-            Rect::new(win_w / 2.0, content_y, win_w / 2.0, content_h / 2.0),
-            Rect::new(win_w / 2.0, content_y + content_h / 2.0, win_w / 2.0, content_h / 2.0),
-        ],
-        _ => {
-            let hw = win_w / 2.0;
-            let hh = content_h / 2.0;
-            vec![
-                Rect::new(0.0, content_y,        hw, hh),
-                Rect::new(hw,  content_y,        hw, hh),
-                Rect::new(0.0, content_y + hh,   hw, hh),
-                Rect::new(hw,  content_y + hh,   hw, hh),
-            ]
-        }
-    }
+/// The terminal content area of a pane, below that pane's own tab bar.
+pub fn pane_content(rect: Rect, tab_bar_h: f32) -> Rect {
+    let tab_bar_h = tab_bar_h.min(rect.h);
+    Rect::new(rect.x, rect.y + tab_bar_h, rect.w, rect.h - tab_bar_h)
 }
 
-/// Given a pixel position, returns the pane index it falls in (if any).
-pub fn hit_pane(px: f32, py: f32, rects: &[Rect]) -> Option<usize> {
-    rects.iter().position(|r| {
-        px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h
-    })
+/// Tiles `area` according to the split tree, returning each pane's id and
+/// rectangle (including its own tab bar) in layout order.
+pub fn layout_rects(node: &LayoutNode, area: Rect) -> Vec<(usize, Rect)> {
+    fn walk(node: &LayoutNode, area: Rect, out: &mut Vec<(usize, Rect)>) {
+        match node {
+            LayoutNode::Leaf(id) => out.push((*id, area)),
+            LayoutNode::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                let ratio = ratio.clamp(0.1, 0.9);
+                match dir {
+                    SplitDir::Horizontal => {
+                        let w = area.w * ratio;
+                        walk(first, Rect::new(area.x, area.y, w, area.h), out);
+                        walk(
+                            second,
+                            Rect::new(area.x + w, area.y, area.w - w, area.h),
+                            out,
+                        );
+                    }
+                    SplitDir::Vertical => {
+                        let h = area.h * ratio;
+                        walk(first, Rect::new(area.x, area.y, area.w, h), out);
+                        walk(
+                            second,
+                            Rect::new(area.x, area.y + h, area.w, area.h - h),
+                            out,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(node, area, &mut out);
+    out
+}
+
+/// Given a pixel position, returns the id of the pane it falls in (if any).
+pub fn hit_pane(px: f32, py: f32, rects: &[(usize, Rect)]) -> Option<usize> {
+    rects
+        .iter()
+        .find(|(_, r)| px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h)
+        .map(|(id, _)| *id)
 }
