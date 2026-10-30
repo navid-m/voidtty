@@ -13,10 +13,7 @@ use app::App;
 use config::Config;
 use renderer::Renderer;
 use terminal::{Color, Style};
-use ui::{
-    PANE_PAD, TAB_BAR_H, TAB_BAR_PAD, TAB_INDICATOR_GAP, TAB_INDICATOR_RADIUS,
-    TAB_INDICATOR_SIZE, pane_rects, text_cols, text_rows,
-};
+use ui::{UiMetrics, pane_rects, text_cols, text_rows};
 
 const FALLBACK_FONT: &[u8] = include_bytes!("../assets/font.ttf");
 
@@ -44,6 +41,9 @@ fn main() -> Result<()> {
         )
         .context("creating GLFW window")?;
 
+    let content_scale = window.get_content_scale();
+    let ui = UiMetrics::new(content_scale.0.max(content_scale.1));
+
     window.make_current();
     window.set_key_polling(true);
     window.set_char_polling(true);
@@ -66,20 +66,20 @@ fn main() -> Result<()> {
     let mut app = App::new(config)?;
 
     // Size the PTY grids to the actual panes before the first frame.
-    resize_ptys(&mut app, &renderer);
+    resize_ptys(&mut app, &renderer, ui);
 
     while !window.should_close() && app.running {
         glfw.poll_events();
-        process_events(&events, &mut window, &mut app, &mut renderer)?;
+        process_events(&events, &mut window, &mut app, &mut renderer, ui)?;
         app.reap_exited_panes();
         if !app.running {
             break;
         }
         if (renderer.font_size - app.config.font_size).abs() > f32::EPSILON {
             renderer.set_font_size(app.config.font_size)?;
-            resize_ptys(&mut app, &renderer);
+            resize_ptys(&mut app, &renderer, ui);
         }
-        draw_frame(&mut renderer, &app)?;
+        draw_frame(&mut renderer, &app, ui)?;
         window.swap_buffers();
     }
 
@@ -91,21 +91,28 @@ fn process_events(
     window: &mut glfw::Window,
     app: &mut App,
     renderer: &mut Renderer,
+    ui: UiMetrics,
 ) -> Result<()> {
     for (_, event) in glfw::flush_messages(events) {
         match event {
             WindowEvent::FramebufferSize(w, h) => {
                 renderer.resize(w as u32, h as u32);
-                resize_ptys(app, renderer);
+                resize_ptys(app, renderer, ui);
             }
             WindowEvent::Char(c) => {
                 input::handle_char(c, app)?;
             }
             WindowEvent::MouseButton(btn, glfw::Action::Press, _) => {
                 let (mx, my) = window.get_cursor_pos();
-                let rects =
-                    pane_rects(renderer.win_w, renderer.win_h, app.active_tab().panes.len());
-                if let Some(idx) = ui::hit_pane(mx as f32, my as f32, &rects) {
+                let rects = pane_rects(
+                    renderer.win_w,
+                    renderer.win_h,
+                    app.active_tab().panes.len(),
+                    ui.tab_bar_h,
+                );
+                if let Some(idx) =
+                    ui::hit_pane(mx as f32 * ui.scale, my as f32 * ui.scale, &rects)
+                {
                     app.active_tab_mut().focused = idx;
                 }
                 let _ = btn;
@@ -192,20 +199,25 @@ fn cell_colors(style: Style) -> ((f32, f32, f32), (f32, f32, f32), bool) {
     (fg, bg, fill)
 }
 
-fn draw_frame(renderer: &mut Renderer, app: &App) -> Result<()> {
+fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
     let opacity = app.config.opacity;
     // Black background respecting transparency.
     renderer.clear(0.0, 0.0, 0.0, opacity);
 
     let tab = app.active_tab();
-    let rects = pane_rects(renderer.win_w, renderer.win_h, tab.panes.len());
+    let rects = pane_rects(
+        renderer.win_w,
+        renderer.win_h,
+        tab.panes.len(),
+        ui.tab_bar_h,
+    );
 
     // Tab bar background with a subtle dark-blue separator below it.
     renderer.draw_rect(
         0.0,
         0.0,
         renderer.win_w,
-        TAB_BAR_H,
+        ui.tab_bar_h,
         0.04,
         0.045,
         0.07,
@@ -213,29 +225,31 @@ fn draw_frame(renderer: &mut Renderer, app: &App) -> Result<()> {
     );
     renderer.draw_rect(
         0.0,
-        TAB_BAR_H - 1.0,
+        ui.tab_bar_h - ui.scale,
         renderer.win_w,
-        1.0,
+        ui.scale,
         0.10,
         0.13,
         0.20,
         opacity,
     );
 
-    // Fixed-size tab indicators: independent of the terminal font size.
-    let y = (TAB_BAR_H - TAB_INDICATOR_SIZE) * 0.5;
+    // DPI-scaled tab indicators: independent of the terminal font size.
+    let size = ui.tab_indicator_size;
+    let y = (ui.tab_bar_h - size) * 0.5;
     for (i, t) in app.tabs.iter().enumerate() {
         let active = i == app.active_tab;
-        let x = TAB_BAR_PAD + i as f32 * (TAB_INDICATOR_SIZE + TAB_INDICATOR_GAP);
+        let x = ui.tab_bar_pad + i as f32 * (size + ui.tab_indicator_gap);
         let (r, g, b) = tab_color(t.accent, active);
 
         if active {
+            let glow = 3.0 * ui.scale;
             renderer.draw_round_rect(
-                x - 3.0,
-                y - 3.0,
-                TAB_INDICATOR_SIZE + 6.0,
-                TAB_INDICATOR_SIZE + 6.0,
-                TAB_INDICATOR_RADIUS + 3.0,
+                x - glow,
+                y - glow,
+                size + glow * 2.0,
+                size + glow * 2.0,
+                ui.tab_indicator_radius + glow,
                 r,
                 g,
                 b,
@@ -246,9 +260,9 @@ fn draw_frame(renderer: &mut Renderer, app: &App) -> Result<()> {
         renderer.draw_round_rect(
             x,
             y,
-            TAB_INDICATOR_SIZE,
-            TAB_INDICATOR_SIZE,
-            TAB_INDICATOR_RADIUS,
+            size,
+            size,
+            ui.tab_indicator_radius,
             r,
             g,
             b,
@@ -265,13 +279,13 @@ fn draw_frame(renderer: &mut Renderer, app: &App) -> Result<()> {
 
         // Border highlight for focused pane.
         if focused {
-            let t = 1.5f32;
+            let t = 1.5 * ui.scale;
             renderer.draw_rect(rect.x, rect.y, rect.w, t, 0.3, 0.7, 1.0, 0.8);
             renderer.draw_rect(rect.x, rect.y, t, rect.h, 0.3, 0.7, 1.0, 0.8);
             renderer.draw_rect(rect.x, rect.y + rect.h - t, rect.w, t, 0.3, 0.7, 1.0, 0.8);
             renderer.draw_rect(rect.x + rect.w - t, rect.y, t, rect.h, 0.3, 0.7, 1.0, 0.8);
         } else {
-            let t = 1.0f32;
+            let t = ui.scale;
             let c = 0.2f32;
             renderer.draw_rect(rect.x, rect.y, rect.w, t, c, c, c, 0.6);
             renderer.draw_rect(rect.x, rect.y, t, rect.h, c, c, c, 0.6);
@@ -284,7 +298,7 @@ fn draw_frame(renderer: &mut Renderer, app: &App) -> Result<()> {
         let lh = renderer.line_height();
 
         for (row, cells) in rows.iter().enumerate() {
-            let y = rect.y + PANE_PAD + row as f32 * lh;
+            let y = rect.y + ui.pane_pad + row as f32 * lh;
             let last = cells
                 .iter()
                 .rposition(|c| c.ch != ' ' || c.style != Style::default())
@@ -297,7 +311,7 @@ fn draw_frame(renderer: &mut Renderer, app: &App) -> Result<()> {
             let mut colors = Vec::with_capacity(last);
             for (col, cell) in cells[..last].iter().enumerate() {
                 let (fg, bg, fill) = cell_colors(cell.style);
-                let x = rect.x + PANE_PAD + col as f32 * cw;
+                let x = rect.x + ui.pane_pad + col as f32 * cw;
                 if fill {
                     renderer.draw_rect(x, y, cw, lh, bg.0, bg.1, bg.2, opacity);
                 }
@@ -308,7 +322,7 @@ fn draw_frame(renderer: &mut Renderer, app: &App) -> Result<()> {
             }
 
             let text: String = cells[..last].iter().map(|c| c.ch).collect();
-            renderer.draw_text_styled(&text, &colors, rect.x + PANE_PAD, y, 1.0)?;
+            renderer.draw_text_styled(&text, &colors, rect.x + ui.pane_pad, y, 1.0)?;
         }
     }
 
@@ -316,14 +330,19 @@ fn draw_frame(renderer: &mut Renderer, app: &App) -> Result<()> {
 }
 
 /// Recalculates PTY cols/rows after a resize event.
-fn resize_ptys(app: &mut App, renderer: &Renderer) {
+fn resize_ptys(app: &mut App, renderer: &Renderer, ui: UiMetrics) {
     let cw = renderer.cell_w();
     let lh = renderer.line_height();
     for tab in app.tabs.iter_mut() {
-        let rects = pane_rects(renderer.win_w, renderer.win_h, tab.panes.len());
+        let rects = pane_rects(
+            renderer.win_w,
+            renderer.win_h,
+            tab.panes.len(),
+            ui.tab_bar_h,
+        );
         for (pane, rect) in tab.panes.iter_mut().zip(rects.iter()) {
-            let cols = text_cols(rect.w, cw).max(1) as u16;
-            let rows = text_rows(rect.h, lh).max(1) as u16;
+            let cols = text_cols(rect.w, cw, ui.pane_pad).max(1) as u16;
+            let rows = text_rows(rect.h, lh, ui.pane_pad).max(1) as u16;
             let _ = pane.pty.resize(cols, rows);
         }
     }

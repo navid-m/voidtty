@@ -112,9 +112,16 @@ impl GlyphAtlas {
             max_w
         }
         .max(1);
+        // Use the font's line metrics so glyphs sit correctly inside their cell
+        // (important for full-height UI bars such as Neovim's statusline).
+        let line_metrics = font.horizontal_line_metrics(font_size);
+        let line_h = line_metrics
+            .map(|m| m.new_line_size.ceil() as u32)
+            .unwrap_or(0);
+
         // Atlas slots must still fit glyphs that overhang their advance.
         let slot_w = cell_w.max(max_w);
-        let cell_h = max_h.max(1);
+        let cell_h = max_h.max(line_h).max(1);
 
         let cols: u32 = 16;
         let rows = (glyph_ids.len() as u32 + cols - 1) / cols;
@@ -124,9 +131,9 @@ impl GlyphAtlas {
         let mut pixels = vec![0u8; (atlas_w * atlas_h) as usize];
         let mut glyphs: HashMap<u16, GlyphMetrics> = HashMap::new();
 
-        // Use 'M' to measure ascent (distance from baseline to top of caps).
-        let (ref_m, _) = font.rasterize('M', font_size);
-        let ascent = ref_m.height as f32;
+        let ascent = line_metrics
+            .map(|m| m.ascent)
+            .unwrap_or_else(|| font.rasterize('M', font_size).0.height as f32);
 
         for (i, &id) in glyph_ids.iter().enumerate() {
             let (m, bitmap) = font.rasterize_indexed(id, font_size);
