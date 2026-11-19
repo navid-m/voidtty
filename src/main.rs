@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     let config = Config::load()?;
 
     let font = load_font(&config);
-    eprintln!("voidtty: using font \"{}\"", font.family);
+    eprintln!("voidtty: using font \"{}\"", font.0.family);
 
     let mut glfw = glfw::init(glfw::fail_on_errors).context("initialising GLFW")?;
 
@@ -74,11 +74,12 @@ fn main() -> Result<()> {
 
     let (fw, fh) = window.get_framebuffer_size();
     let mut renderer = Renderer::new(
-        &font.data,
-        font.face_index,
+        &font.0.data,
+        font.0.face_index,
         config.font_size,
         fw as u32,
         fh as u32,
+        font.1,
     )
     .context("initialising renderer")?;
     ui = ui.with_tab_bar_height(renderer.line_height());
@@ -690,16 +691,25 @@ fn set_window_icon(window: &mut glfw::Window) {
     }]);
 }
 
-fn load_font(config: &Config) -> font::LoadedFont {
-    if let Ok(path) = std::env::var("voidtty_FONT") {
+fn load_font(config: &Config) -> (font::LoadedFont, font::FallbackFonts) {
+    let loaded = if let Ok(path) = std::env::var("voidtty_FONT") {
         if let Ok(data) = std::fs::read(&path) {
-            return font::LoadedFont {
+            font::LoadedFont {
                 data,
                 face_index: 0,
                 family: path,
-            };
+            }
+        } else {
+            fallback_font(config)
         }
-    }
+    } else {
+        fallback_font(config)
+    };
+    let fallbacks = font::FallbackFonts::new(&loaded.family);
+    (loaded, fallbacks)
+}
+
+fn fallback_font(config: &Config) -> font::LoadedFont {
     font::load(&config.font_family).unwrap_or_else(|| font::LoadedFont {
         data: FALLBACK_FONT.to_vec(),
         face_index: 0,

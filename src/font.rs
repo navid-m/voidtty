@@ -44,6 +44,69 @@ const MONOSPACE_FAMILIES: &[&str] = &[
     "FreeMono",
 ];
 
+/// Symbol-capable families tried, in order, when the primary font lacks a
+/// glyph. Most desktop systems have at least one of these installed.
+const FALLBACK_FAMILIES: &[&str] = &[
+    "DejaVu Sans",
+    "FreeSans",
+    "Noto Sans Symbols 2",
+    "Noto Sans Symbols2",
+    "Noto Sans Symbols",
+    "Symbola",
+    "Noto Sans",
+    "Liberation Sans",
+    "Segoe UI Symbol",
+    "Apple Symbols",
+    "Arial Unicode MS",
+];
+
+/// Lazily loadable fallback faces for glyphs missing from the primary font.
+pub struct FallbackFonts {
+    db: Database,
+    candidates: Vec<ID>,
+    next: usize,
+}
+
+impl FallbackFonts {
+    /// Resolves candidate family names against the installed system fonts.
+    pub fn new(primary_family: &str) -> Self {
+        let mut db = Database::new();
+        db.load_system_fonts();
+
+        let mut candidates = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for family in FALLBACK_FAMILIES {
+            let Some(id) = find_family(&db, family) else {
+                continue;
+            };
+            let same_as_primary = db
+                .face(id)
+                .is_some_and(|face| family_name(face).eq_ignore_ascii_case(primary_family));
+            if !same_as_primary && seen.insert(id) {
+                candidates.push(id);
+            }
+        }
+
+        Self {
+            db,
+            candidates,
+            next: 0,
+        }
+    }
+
+    /// Loads the next candidate face, if any remain.
+    pub fn next(&mut self) -> Option<LoadedFont> {
+        while self.next < self.candidates.len() {
+            let id = self.candidates[self.next];
+            self.next += 1;
+            if let Some(font) = load_face(&self.db, id) {
+                return Some(font);
+            }
+        }
+        None
+    }
+}
+
 /// Loads the best available system font.
 ///
 /// `preferred` is a comma-separated list of family names from the config file.

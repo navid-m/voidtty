@@ -18,6 +18,8 @@ pub struct GlyphMetrics {
     pub v1: f32,
     pub bw: f32,
     pub bh: f32,
+    /// Horizontal advance reported by the font.
+    pub advance: f32,
     /// Horizontal offset from pen to bitmap left edge.
     pub xoff: f32,
     /// Vertical offset from baseline to bitmap top edge.
@@ -37,6 +39,15 @@ pub struct GlyphAtlas {
 struct ShapedGlyph {
     glyph_id: u16,
     cluster: u32,
+    x_offset: f32,
+    y_offset: f32,
+}
+
+/// A shaped glyph resolved to the face that can actually draw it.
+struct ResolvedGlyph {
+    face: usize,
+    glyph: u16,
+    cell: usize,
     x_offset: f32,
     y_offset: f32,
 }
@@ -168,6 +179,7 @@ impl GlyphAtlas {
                     v1: (oy + m.height as u32) as f32 / atlas_h as f32,
                     bw: m.width as f32,
                     bh: m.height as f32,
+                    advance: m.advance_width,
                     xoff: m.xmin as f32,
                     yoff: m.ymin as f32,
                 },
@@ -388,6 +400,34 @@ struct Uniforms {
     round_radius: GLint,
 }
 
+/// One font face with its own glyph atlas. Index 0 is the primary font; the
+/// rest are fallbacks used for characters the primary font lacks.
+struct Face {
+    data: Vec<u8>,
+    face_index: u32,
+    atlas: GlyphAtlas,
+    glyph_ids: HashSet<u16>,
+}
+
+impl Face {
+    fn new(data: Vec<u8>, face_index: u32, font_size: f32) -> Result<Self> {
+        let atlas =
+            GlyphAtlas::build(&data, face_index, font_size, &[]).context("building glyph atlas")?;
+        Ok(Self {
+            data,
+            face_index,
+            atlas,
+            glyph_ids: HashSet::new(),
+        })
+    }
+
+    /// Glyph id for `c`, or `None` when this face has no coverage for it.
+    fn glyph_for(&self, c: char) -> Option<u16> {
+        let face = rustybuzz::Face::from_slice(&self.data, self.face_index)?;
+        face.glyph_index(c).map(|g| g.0).filter(|&glyph| glyph != 0)
+    }
+}
+
 pub struct Renderer {
     prog_text: GLuint,
     prog_rect: GLuint,
@@ -399,18 +439,20 @@ pub struct Renderer {
     vao_round: GLuint,
     vbo_round: GLuint,
     uniforms: Uniforms,
-    pub atlas: GlyphAtlas,
+    faces: Vec<Face>,
+    fallback_source: crate::font::FallbackFonts,
+    /// Resolved fallback glyph per character (cached across frames).
+    fallback_cache: HashMap<char, Option<(usize, u16)>>,
     pub win_w: f32,
     pub win_h: f32,
     pub font_size: f32,
-    font_data: Vec<u8>,
-    face_index: u32,
-    glyph_ids: HashSet<u16>,
     /// Shaped lines keyed by their text, so unchanged rows are not reshaped.
     line_cache: HashMap<String, Rc<Vec<ShapedGlyph>>>,
     /// Batching buffers flushed at most once per pane.
     text_verts: Vec<TV>,
     rect_verts: Vec<RV>,
+    /// Atlas texture the pending text vertices belong to.
+    text_texture: GLuint,
 }
 
 fn ascii_sample() -> String {
@@ -424,15 +466,23 @@ impl Renderer {
         font_size: f32,
         win_w: u32,
         win_h: u32,
+        fallback_source: crate::font::FallbackFonts,
     ) -> Result<Self> {
         let glyph_ids: HashSet<u16> = shape_text(font_data, face_index, font_size, &ascii_sample())
             .into_iter()
             .map(|g| g.glyph_id)
+            .filter(|&id| id != 0)
             .collect();
         let mut initial: Vec<u16> = glyph_ids.iter().copied().collect();
         initial.sort_unstable();
         let atlas = GlyphAtlas::build(font_data, face_index, font_size, &initial)
             .context("building glyph atlas")?;
+        let primary = Face {
+            data: font_data.to_vec(),
+            face_index,
+            atlas,
+            glyph_ids,
+        };
 
         let prog_text = link_program(
             compile_shader(VS_TEXT, gl::VERTEX_SHADER)?,
@@ -480,39 +530,79 @@ impl Renderer {
             vao_round,
             vbo_round,
             uniforms,
-            atlas,
+            faces: vec![primary],
+            fallback_source,
+            fallback_cache: HashMap::new(),
             win_w: win_w as f32,
             win_h: win_h as f32,
             font_size,
-            font_data: font_data.to_vec(),
-            face_index,
-            glyph_ids,
             line_cache: HashMap::new(),
             text_verts: Vec::new(),
             rect_verts: Vec::new(),
+            text_texture: 0,
         })
     }
 
-    fn rebuild_atlas(&mut self) -> Result<()> {
-        let mut ids: Vec<u16> = self.glyph_ids.iter().copied().collect();
+    /// Rebuilds one face's atlas after its glyph set changes.
+    fn rebuild_face(&mut self, index: usize) -> Result<()> {
+        // Pending vertices reference the old texture; draw them first.
+        self.flush_text();
+        self.text_texture = 0;
+
+        let font_size = self.font_size;
+        let face = &mut self.faces[index];
+        let mut ids: Vec<u16> = face.glyph_ids.iter().copied().collect();
         ids.sort_unstable();
-        let atlas = GlyphAtlas::build(&self.font_data, self.face_index, self.font_size, &ids)
+        let atlas = GlyphAtlas::build(&face.data, face.face_index, font_size, &ids)
             .context("rebuilding glyph atlas")?;
-        let old = std::mem::replace(&mut self.atlas, atlas);
-        self.line_cache.clear();
+        let old = std::mem::replace(&mut face.atlas, atlas);
         unsafe {
             gl::DeleteTextures(1, &old.texture);
         }
         Ok(())
     }
 
-    /// Rebuilds the glyph atlas at a new size, replacing the old texture.
+    /// Rebuilds every glyph atlas at a new size, replacing the old textures.
     pub fn set_font_size(&mut self, size: f32) -> Result<()> {
         if (size - self.font_size).abs() < f32::EPSILON {
             return Ok(());
         }
         self.font_size = size;
-        self.rebuild_atlas()
+        self.line_cache.clear();
+        for index in 0..self.faces.len() {
+            self.rebuild_face(index)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the face and glyph id for `c`, loading fallback fonts as needed.
+    fn fallback_glyph(&mut self, c: char) -> Option<(usize, u16)> {
+        if let Some(&cached) = self.fallback_cache.get(&c) {
+            return cached;
+        }
+
+        for (index, face) in self.faces.iter().enumerate().skip(1) {
+            if let Some(glyph) = face.glyph_for(c) {
+                self.fallback_cache.insert(c, Some((index, glyph)));
+                return Some((index, glyph));
+            }
+        }
+
+        while let Some(font) = self.fallback_source.next() {
+            let Ok(face) = Face::new(font.data, font.face_index, self.font_size) else {
+                continue;
+            };
+            let glyph = face.glyph_for(c);
+            let index = self.faces.len();
+            self.faces.push(face);
+            if let Some(glyph) = glyph {
+                self.fallback_cache.insert(c, Some((index, glyph)));
+                return Some((index, glyph));
+            }
+        }
+
+        self.fallback_cache.insert(c, None);
+        None
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -534,6 +624,7 @@ impl Renderer {
     pub fn begin_frame(&mut self) {
         self.rect_verts.clear();
         self.text_verts.clear();
+        self.text_texture = 0;
     }
 
     /// Emits all batched geometry. Rectangles are drawn before text so glyphs
@@ -564,12 +655,18 @@ impl Renderer {
         if self.text_verts.is_empty() {
             return;
         }
+        // The primary atlas is the default when nothing was batch-bound yet.
+        let texture = if self.text_texture != 0 {
+            self.text_texture
+        } else {
+            self.faces[0].atlas.texture
+        };
         unsafe {
             gl::UseProgram(self.prog_text);
             gl::Uniform2f(self.uniforms.text_res, self.win_w, self.win_h);
             gl::Uniform1i(self.uniforms.text_atlas, 0);
             gl::ActiveTexture(gl::TEXTURE0);
-            gl::BindTexture(gl::TEXTURE_2D, self.atlas.texture);
+            gl::BindTexture(gl::TEXTURE_2D, texture);
             upload_and_draw(
                 self.vao_text,
                 self.vbo_text,
@@ -654,9 +751,10 @@ impl Renderer {
         if let Some(cached) = self.line_cache.get(text) {
             return Rc::clone(cached);
         }
+        let primary = &self.faces[0];
         let shaped = Rc::new(shape_text(
-            &self.font_data,
-            self.face_index,
+            &primary.data,
+            primary.face_index,
             self.font_size,
             text,
         ));
@@ -669,6 +767,7 @@ impl Renderer {
 
     /// Draws shaped text with one color per terminal cell. Ligatures are
     /// formed by the shaper and placed at the cell of their starting cluster.
+    /// Characters the primary font lacks are taken from fallback fonts.
     pub fn draw_text_styled(
         &mut self,
         text: &str,
@@ -685,42 +784,93 @@ impl Renderer {
         self.flush_rects();
 
         let shaped = self.shaped_line(text);
-        let mut changed = false;
-        for g in shaped.iter() {
-            if self.glyph_ids.insert(g.glyph_id) {
-                changed = true;
-            }
-        }
-        if changed {
-            // Pending vertices reference the old atlas, so draw them first.
-            self.flush_text();
-            self.rebuild_atlas()?;
-        }
 
         // Map byte offsets (HarfBuzz clusters) to terminal cell indices.
-        let mut byte_to_cell: Vec<(u32, usize)> = Vec::new();
-        for (cell_idx, (byte, _)) in text.char_indices().enumerate() {
-            byte_to_cell.push((byte as u32, cell_idx));
-        }
-        let fallback = colors.first().copied().unwrap_or((0.9, 0.9, 0.9));
-
-        let baseline = py + self.atlas.ascent;
-        let cell_w = self.atlas.cell_w;
-        self.text_verts.reserve(shaped.len() * 6);
-
-        for sg in shaped.iter() {
-            let cell_idx = match byte_to_cell.binary_search_by_key(&sg.cluster, |&(b, _)| b) {
+        let byte_to_cell: Vec<(u32, usize)> = text
+            .char_indices()
+            .enumerate()
+            .map(|(cell, (byte, _))| (byte as u32, cell))
+            .collect();
+        let cell_for =
+            |cluster: u32| match byte_to_cell.binary_search_by_key(&cluster, |&(byte, _)| byte) {
                 Ok(i) => byte_to_cell[i].1,
                 Err(0) => 0,
                 Err(i) => byte_to_cell[i - 1].1,
             };
-            let Some(gm) = self.atlas.get(sg.glyph_id).copied() else {
+
+        // Resolve every glyph to the face that can draw it, registering glyph
+        // ids that still need rasterising.
+        let mut resolved: Vec<ResolvedGlyph> = Vec::with_capacity(shaped.len());
+        let mut changed_faces: HashSet<usize> = HashSet::new();
+        for sg in shaped.iter() {
+            let cell = cell_for(sg.cluster);
+            if sg.glyph_id != 0 {
+                if self.faces[0].glyph_ids.insert(sg.glyph_id) {
+                    changed_faces.insert(0);
+                }
+                resolved.push(ResolvedGlyph {
+                    face: 0,
+                    glyph: sg.glyph_id,
+                    cell,
+                    x_offset: sg.x_offset,
+                    y_offset: sg.y_offset,
+                });
+                continue;
+            }
+
+            // Glyph 0 is .notdef: find a fallback face covering this character.
+            let Some(ch) = text
+                .get(sg.cluster as usize..)
+                .and_then(|s| s.chars().next())
+            else {
                 continue;
             };
-            let (r, g, b) = colors.get(cell_idx).copied().unwrap_or(fallback);
+            let Some((face, glyph)) = self.fallback_glyph(ch) else {
+                continue;
+            };
+            if self.faces[face].glyph_ids.insert(glyph) {
+                changed_faces.insert(face);
+            }
+            resolved.push(ResolvedGlyph {
+                face,
+                glyph,
+                cell,
+                x_offset: 0.0,
+                y_offset: 0.0,
+            });
+        }
 
-            let x0 = px + cell_idx as f32 * cell_w + sg.x_offset + gm.xoff;
-            let y0 = baseline - gm.bh - gm.yoff - sg.y_offset;
+        for face in changed_faces {
+            self.rebuild_face(face)?;
+        }
+
+        let fallback_color = colors.first().copied().unwrap_or((0.9, 0.9, 0.9));
+        let baseline = py + self.faces[0].atlas.ascent;
+        let cell_w = self.faces[0].atlas.cell_w;
+        self.text_verts.reserve(resolved.len() * 6);
+
+        for rg in &resolved {
+            let (gm, texture) = {
+                let atlas = &self.faces[rg.face].atlas;
+                let Some(gm) = atlas.get(rg.glyph).copied() else {
+                    continue;
+                };
+                (gm, atlas.texture)
+            };
+            if self.text_texture != texture {
+                self.flush_text();
+                self.text_texture = texture;
+            }
+
+            let (r, g, b) = colors.get(rg.cell).copied().unwrap_or(fallback_color);
+            let cell_x = px + rg.cell as f32 * cell_w;
+            let x0 = if rg.face == 0 {
+                cell_x + rg.x_offset + gm.xoff
+            } else {
+                // Fallback faces are proportional; centre their advance in the cell.
+                cell_x + (cell_w - gm.advance).max(0.0) * 0.5 + gm.xoff
+            };
+            let y0 = baseline - gm.bh - gm.yoff - rg.y_offset;
             let x1 = x0 + gm.bw;
             let y1 = y0 + gm.bh;
 
@@ -791,10 +941,10 @@ impl Renderer {
     }
 
     pub fn cell_w(&self) -> f32 {
-        self.atlas.cell_w
+        self.faces[0].atlas.cell_w
     }
     pub fn line_height(&self) -> f32 {
-        self.atlas.line_height
+        self.faces[0].atlas.line_height
     }
 }
 
