@@ -13,7 +13,7 @@ use std::env;
 use app::App;
 use config::Config;
 use renderer::Renderer;
-use terminal::{Color, Style};
+use terminal::{Cell, Color, Style};
 use ui::{Rect, UiMetrics, layout_rects, pane_content, text_cols, text_rows};
 
 const FALLBACK_FONT: &[u8] = include_bytes!("../assets/font.ttf");
@@ -66,7 +66,9 @@ fn main() -> Result<()> {
     window.set_mouse_button_polling(true);
     window.set_scroll_polling(true);
     window.set_cursor_pos_polling(true);
-    glfw.set_swap_interval(glfw::SwapInterval::Sync(1));
+    // Draw only when something changes and present immediately, so keystroke
+    // echo is not held back until the next vertical blank.
+    glfw.set_swap_interval(glfw::SwapInterval::None);
 
     gl::load_with(|s| window.get_proc_address(s));
 
@@ -86,24 +88,44 @@ fn main() -> Result<()> {
     // Size the PTY grids to the actual panes before the first frame.
     resize_ptys(&mut app, &renderer, ui);
 
+    let mut redraw = true;
     while !window.should_close() && app.running {
-        glfw.poll_events();
-        process_events(&events, &mut window, &mut app, &mut renderer, ui)?;
+        if redraw {
+            glfw.poll_events();
+        } else {
+            // Block for input, waking briefly to pick up PTY output. Keystrokes
+            // themselves wake this immediately.
+            glfw.wait_events_timeout(0.002);
+        }
+
+        let events_changed = process_events(&events, &mut window, &mut app, &mut renderer, ui)?;
         app.reap_exited_panes();
         if !app.running {
             break;
         }
+
+        let mut layout_changed = false;
         if (renderer.font_size - app.config.font_size).abs() > f32::EPSILON {
             renderer.set_font_size(app.config.font_size)?;
             ui = ui.with_tab_bar_height(renderer.line_height());
-            resize_ptys(&mut app, &renderer, ui);
-            app.needs_resize = false;
-        } else if app.needs_resize {
-            resize_ptys(&mut app, &renderer, ui);
-            app.needs_resize = false;
+            layout_changed = true;
         }
-        draw_frame(&mut renderer, &app, ui)?;
-        window.swap_buffers();
+        if app.needs_resize || layout_changed {
+            resize_ptys(&mut app, &renderer, ui);
+            app.needs_resize = false;
+            layout_changed = true;
+        }
+
+        let output_changed = app
+            .panes
+            .iter()
+            .any(|pane| pane.tabs.iter().any(|tab| tab.pty.take_dirty()));
+
+        redraw = events_changed || output_changed || layout_changed;
+        if redraw {
+            draw_frame(&mut renderer, &app, ui)?;
+            window.swap_buffers();
+        }
     }
 
     Ok(())
@@ -115,15 +137,18 @@ fn process_events(
     app: &mut App,
     renderer: &mut Renderer,
     ui: UiMetrics,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut redraw = false;
     for (_, event) in glfw::flush_messages(events) {
         match event {
             WindowEvent::FramebufferSize(w, h) => {
                 renderer.resize(w as u32, h as u32);
                 resize_ptys(app, renderer, ui);
+                redraw = true;
             }
             WindowEvent::Char(c) => {
                 input::handle_char(c, app)?;
+                redraw = true;
             }
             WindowEvent::Scroll(_, y) => {
                 let (mx, my) = window.get_cursor_pos();
@@ -138,6 +163,7 @@ fn process_events(
                         .unwrap()
                         .scroll_by_lines(y as f32);
                 }
+                redraw = true;
             }
             WindowEvent::CursorPos(x, y) => {
                 if let Some(id) = app.scroll_drag {
@@ -157,6 +183,7 @@ fn process_events(
                                     .lock()
                                     .unwrap()
                                     .set_scroll_offset(offset);
+                                redraw = true;
                             }
                         }
                     }
@@ -198,20 +225,23 @@ fn process_events(
                         app.focused = *id;
                         app.scroll_drag = Some(*id);
                         grabbed_scrollbar = true;
+                        redraw = true;
                         break;
                     }
                 }
 
                 if !grabbed_scrollbar && let Some(id) = ui::hit_pane(mx, my, &rects) {
                     app.focused = id;
+                    redraw = true;
                 }
             }
             ev => {
                 input::handle_event(ev, app)?;
+                redraw = true;
             }
         }
     }
-    Ok(())
+    Ok(redraw)
 }
 
 /// Computes the current pane rectangles from the split tree.
@@ -359,12 +389,24 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
     let opacity = app.config.opacity;
     // Black background respecting transparency.
     renderer.clear(0.0, 0.0, 0.0, opacity);
+    renderer.begin_frame();
 
+    // Reused row buffers, so drawing does not hold a screen lock.
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
     for (id, rect) in pane_layout(app, renderer) {
         let Some(pane) = app.pane(id) else { continue };
-        draw_pane(renderer, pane, rect, id == app.focused, ui, opacity)?;
+        draw_pane(
+            renderer,
+            pane,
+            rect,
+            id == app.focused,
+            ui,
+            opacity,
+            &mut rows,
+        )?;
     }
 
+    renderer.flush();
     Ok(())
 }
 
@@ -375,6 +417,7 @@ fn draw_pane(
     focused: bool,
     ui: UiMetrics,
     opacity: f32,
+    rows: &mut Vec<Vec<Cell>>,
 ) -> Result<()> {
     // Pane background.
     renderer.draw_rect(rect.x, rect.y, rect.w, rect.h, 0.0, 0.0, 0.0, opacity);
@@ -396,14 +439,27 @@ fn draw_pane(
     draw_tab_bar(renderer, pane, rect, ui, opacity)?;
 
     let content = pane_content(rect, ui.tab_bar_h);
-    let tab = pane.active();
-    let screen = tab.pty.screen.lock().unwrap();
+    // Copy the visible grid out while briefly holding the lock; the PTY reader
+    // thread stays unblocked while text is shaped and uploaded.
+    let ((cursor_row, cursor_col), cursor_visible, scroll_offset, max_scroll, row_count) = {
+        let screen = pane.active().pty.screen.lock().unwrap();
+        screen.copy_visible(rows);
+        (
+            screen.cursor(),
+            screen.cursor_visible(),
+            screen.scroll_offset(),
+            screen.max_scroll(),
+            screen.rows(),
+        )
+    };
     let cw = renderer.cell_w();
     let lh = renderer.line_height();
-    let (cursor_row, cursor_col) = screen.cursor();
-    let show_cursor = focused && screen.scroll_offset() == 0 && screen.cursor_visible();
+    let show_cursor = focused && scroll_offset == 0 && cursor_visible;
 
-    for (row, cells) in screen.display_rows().enumerate() {
+    let mut text = String::new();
+    let mut row_colors: Vec<(f32, f32, f32)> = Vec::new();
+
+    for (row, cells) in rows.iter().enumerate() {
         let y = content.y + ui.pane_pad + row as f32 * lh;
         let cursor_here = show_cursor && row == cursor_row;
         let cursor_cell = cursor_here.then(|| cursor_col.min(cells.len().saturating_sub(1)));
@@ -420,7 +476,21 @@ fn draw_pane(
             continue;
         }
 
-        let mut colors = Vec::with_capacity(last);
+        text.clear();
+        row_colors.clear();
+        row_colors.reserve(last);
+        // Merge neighbouring cells that share a background into one rectangle.
+        let mut run_start: Option<usize> = None;
+        let mut run_color = (0.0f32, 0.0f32, 0.0f32);
+        let flush_run =
+            |renderer: &mut Renderer, start: Option<usize>, end: usize, color: (f32, f32, f32)| {
+                if let Some(start) = start {
+                    let x = content.x + ui.pane_pad + start as f32 * cw;
+                    let w = (end - start) as f32 * cw;
+                    renderer.draw_rect(x, y, w, lh, color.0, color.1, color.2, opacity);
+                }
+            };
+
         for (col, cell) in cells[..last].iter().enumerate() {
             let style = if Some(col) == cursor_cell {
                 // Solid, non-blinking block cursor.
@@ -435,25 +505,34 @@ fn draw_pane(
                 cell.style
             };
             let (fg, bg, fill) = cell_colors(style);
-            let x = content.x + ui.pane_pad + col as f32 * cw;
             if fill {
-                renderer.draw_rect(x, y, cw, lh, bg.0, bg.1, bg.2, opacity);
+                if run_start.is_some() && run_color == bg {
+                    // The run continues.
+                } else {
+                    flush_run(renderer, run_start, col, run_color);
+                    run_start = Some(col);
+                    run_color = bg;
+                }
+            } else {
+                flush_run(renderer, run_start, col, run_color);
+                run_start = None;
             }
+            let x = content.x + ui.pane_pad + col as f32 * cw;
             if style.underline {
                 renderer.draw_rect(x, y + lh - 1.5, cw, 1.0, fg.0, fg.1, fg.2, opacity);
             }
-            colors.push(fg);
+            text.push(cell.ch);
+            row_colors.push(fg);
         }
+        flush_run(renderer, run_start, last, run_color);
 
-        let text: String = cells[..last].iter().map(|c| c.ch).collect();
-        renderer.draw_text_styled(&text, &colors, content.x + ui.pane_pad, y, 1.0)?;
+        renderer.draw_text_styled(&text, &row_colors, content.x + ui.pane_pad, y, 1.0)?;
     }
 
     // Vertical scrollbar, drawn inside the pane's right padding.
-    let max_scroll = screen.max_scroll();
-    if let Some(geom) = scrollbar_geometry(&content, ui, max_scroll, screen.rows()) {
+    if let Some(geom) = scrollbar_geometry(&content, ui, max_scroll, row_count) {
         let radius = geom.w * 0.5;
-        let frac = screen.scroll_offset() as f32 / max_scroll as f32;
+        let frac = scroll_offset as f32 / max_scroll as f32;
         let thumb_y = geom.y + (geom.track_h - geom.thumb_h) * (1.0 - frac);
 
         renderer.draw_round_rect(

@@ -3,6 +3,10 @@ use fontdue::{Font, FontSettings};
 use gl::types::*;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
+use std::rc::Rc;
+
+/// Number of shaped lines kept between frames before the cache is dropped.
+const LINE_CACHE_CAPACITY: usize = 2048;
 
 // ── Glyph atlas ───────────────────────────────────────────────────────────────
 
@@ -337,6 +341,7 @@ fn link_program(vs: GLuint, fs: GLuint) -> Result<GLuint> {
 // ── Vertex types ──────────────────────────────────────────────────────────────
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct TV {
     x: f32,
     y: f32,
@@ -349,6 +354,7 @@ struct TV {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct RV {
     x: f32,
     y: f32,
@@ -372,6 +378,16 @@ struct R2V {
 
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
+/// Cached uniform locations, resolved once at startup.
+struct Uniforms {
+    text_res: GLint,
+    text_atlas: GLint,
+    rect_res: GLint,
+    round_res: GLint,
+    round_half: GLint,
+    round_radius: GLint,
+}
+
 pub struct Renderer {
     prog_text: GLuint,
     prog_rect: GLuint,
@@ -382,6 +398,7 @@ pub struct Renderer {
     vbo_rect: GLuint,
     vao_round: GLuint,
     vbo_round: GLuint,
+    uniforms: Uniforms,
     pub atlas: GlyphAtlas,
     pub win_w: f32,
     pub win_h: f32,
@@ -389,6 +406,11 @@ pub struct Renderer {
     font_data: Vec<u8>,
     face_index: u32,
     glyph_ids: HashSet<u16>,
+    /// Shaped lines keyed by their text, so unchanged rows are not reshaped.
+    line_cache: HashMap<String, Rc<Vec<ShapedGlyph>>>,
+    /// Batching buffers flushed at most once per pane.
+    text_verts: Vec<TV>,
+    rect_verts: Vec<RV>,
 }
 
 fn ascii_sample() -> String {
@@ -430,6 +452,17 @@ impl Renderer {
         let (vao_round, vbo_round) =
             unsafe { make_vao::<R2V>(&[(0, 2, 0), (1, 2, 8), (2, 4, 16)]) };
 
+        let uniforms = unsafe {
+            Uniforms {
+                text_res: get_uniform(prog_text, "uRes"),
+                text_atlas: get_uniform(prog_text, "uAtlas"),
+                rect_res: get_uniform(prog_rect, "uRes"),
+                round_res: get_uniform(prog_round, "uRes"),
+                round_half: get_uniform(prog_round, "uHalfSize"),
+                round_radius: get_uniform(prog_round, "uRadius"),
+            }
+        };
+
         unsafe {
             gl::Enable(gl::BLEND);
             gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
@@ -446,6 +479,7 @@ impl Renderer {
             vbo_rect,
             vao_round,
             vbo_round,
+            uniforms,
             atlas,
             win_w: win_w as f32,
             win_h: win_h as f32,
@@ -453,6 +487,9 @@ impl Renderer {
             font_data: font_data.to_vec(),
             face_index,
             glyph_ids,
+            line_cache: HashMap::new(),
+            text_verts: Vec::new(),
+            rect_verts: Vec::new(),
         })
     }
 
@@ -462,6 +499,7 @@ impl Renderer {
         let atlas = GlyphAtlas::build(&self.font_data, self.face_index, self.font_size, &ids)
             .context("rebuilding glyph atlas")?;
         let old = std::mem::replace(&mut self.atlas, atlas);
+        self.line_cache.clear();
         unsafe {
             gl::DeleteTextures(1, &old.texture);
         }
@@ -492,8 +530,59 @@ impl Renderer {
         }
     }
 
-    /// Draws a filled axis-aligned rectangle in pixel coordinates.
-    pub fn draw_rect(&self, x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32, a: f32) {
+    /// Starts a new frame, resetting the geometry batches.
+    pub fn begin_frame(&mut self) {
+        self.rect_verts.clear();
+        self.text_verts.clear();
+    }
+
+    /// Emits all batched geometry. Rectangles are drawn before text so glyphs
+    /// always sit on top of their cell backgrounds.
+    pub fn flush(&mut self) {
+        self.flush_rects();
+        self.flush_text();
+    }
+
+    fn flush_rects(&mut self) {
+        if self.rect_verts.is_empty() {
+            return;
+        }
+        unsafe {
+            gl::UseProgram(self.prog_rect);
+            gl::Uniform2f(self.uniforms.rect_res, self.win_w, self.win_h);
+            upload_and_draw(
+                self.vao_rect,
+                self.vbo_rect,
+                &self.rect_verts,
+                self.rect_verts.len() as i32,
+            );
+        }
+        self.rect_verts.clear();
+    }
+
+    fn flush_text(&mut self) {
+        if self.text_verts.is_empty() {
+            return;
+        }
+        unsafe {
+            gl::UseProgram(self.prog_text);
+            gl::Uniform2f(self.uniforms.text_res, self.win_w, self.win_h);
+            gl::Uniform1i(self.uniforms.text_atlas, 0);
+            gl::ActiveTexture(gl::TEXTURE0);
+            gl::BindTexture(gl::TEXTURE_2D, self.atlas.texture);
+            upload_and_draw(
+                self.vao_text,
+                self.vbo_text,
+                &self.text_verts,
+                self.text_verts.len() as i32,
+            );
+        }
+        self.text_verts.clear();
+    }
+
+    /// Draws a filled axis-aligned rectangle in pixel coordinates. Geometry is
+    /// batched and submitted once per flush.
+    pub fn draw_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32, a: f32) {
         let (x1, y1) = (x + w, y + h);
         let mk = |px: f32, py: f32| RV {
             x: px,
@@ -503,24 +592,19 @@ impl Renderer {
             b,
             a,
         };
-        let verts = [
+        self.rect_verts.extend_from_slice(&[
             mk(x, y),
             mk(x1, y),
             mk(x, y1),
             mk(x1, y),
             mk(x1, y1),
             mk(x, y1),
-        ];
-        unsafe {
-            gl::UseProgram(self.prog_rect);
-            uniform2f(self.prog_rect, "uRes", self.win_w, self.win_h);
-            upload_and_draw(self.vao_rect, self.vbo_rect, &verts, 6);
-        }
+        ]);
     }
 
     /// Draws a filled rounded rectangle using a signed-distance fragment shader.
     pub fn draw_round_rect(
-        &self,
+        &mut self,
         x: f32,
         y: f32,
         w: f32,
@@ -531,6 +615,9 @@ impl Renderer {
         b: f32,
         a: f32,
     ) {
+        // Flush first so the round rectangle keeps its place in the draw order.
+        self.flush();
+
         let radius = radius.clamp(0.0, w.min(h) * 0.5);
         let (x1, y1) = (x + w, y + h);
         let (cx, cy) = (x + w * 0.5, y + h * 0.5);
@@ -554,11 +641,30 @@ impl Renderer {
         ];
         unsafe {
             gl::UseProgram(self.prog_round);
-            uniform2f(self.prog_round, "uRes", self.win_w, self.win_h);
-            uniform2f(self.prog_round, "uHalfSize", w * 0.5, h * 0.5);
-            uniform1f(self.prog_round, "uRadius", radius);
+            gl::Uniform2f(self.uniforms.round_res, self.win_w, self.win_h);
+            gl::Uniform2f(self.uniforms.round_half, w * 0.5, h * 0.5);
+            gl::Uniform1f(self.uniforms.round_radius, radius);
             upload_and_draw(self.vao_round, self.vbo_round, &verts, 6);
         }
+    }
+
+    /// Shapes a line, reusing a cached result when the same text was shaped
+    /// before (the common case while redrawing an idle screen).
+    fn shaped_line(&mut self, text: &str) -> Rc<Vec<ShapedGlyph>> {
+        if let Some(cached) = self.line_cache.get(text) {
+            return Rc::clone(cached);
+        }
+        let shaped = Rc::new(shape_text(
+            &self.font_data,
+            self.face_index,
+            self.font_size,
+            text,
+        ));
+        if self.line_cache.len() >= LINE_CACHE_CAPACITY {
+            self.line_cache.clear();
+        }
+        self.line_cache.insert(text.to_owned(), Rc::clone(&shaped));
+        shaped
     }
 
     /// Draws shaped text with one color per terminal cell. Ligatures are
@@ -575,14 +681,19 @@ impl Renderer {
             return Ok(());
         }
 
-        let shaped = shape_text(&self.font_data, self.face_index, self.font_size, text);
+        // Cell backgrounds for this row precede its glyphs.
+        self.flush_rects();
+
+        let shaped = self.shaped_line(text);
         let mut changed = false;
-        for g in &shaped {
+        for g in shaped.iter() {
             if self.glyph_ids.insert(g.glyph_id) {
                 changed = true;
             }
         }
         if changed {
+            // Pending vertices reference the old atlas, so draw them first.
+            self.flush_text();
             self.rebuild_atlas()?;
         }
 
@@ -595,15 +706,15 @@ impl Renderer {
 
         let baseline = py + self.atlas.ascent;
         let cell_w = self.atlas.cell_w;
-        let mut verts: Vec<TV> = Vec::with_capacity(shaped.len() * 6);
+        self.text_verts.reserve(shaped.len() * 6);
 
-        for sg in &shaped {
+        for sg in shaped.iter() {
             let cell_idx = match byte_to_cell.binary_search_by_key(&sg.cluster, |&(b, _)| b) {
                 Ok(i) => byte_to_cell[i].1,
                 Err(0) => 0,
                 Err(i) => byte_to_cell[i - 1].1,
             };
-            let Some(gm) = self.atlas.get(sg.glyph_id) else {
+            let Some(gm) = self.atlas.get(sg.glyph_id).copied() else {
                 continue;
             };
             let (r, g, b) = colors.get(cell_idx).copied().unwrap_or(fallback);
@@ -613,38 +724,68 @@ impl Renderer {
             let x1 = x0 + gm.bw;
             let y1 = y0 + gm.bh;
 
-            for &(x, y, u, v) in &[
-                (x0, y0, gm.u0, gm.v0),
-                (x1, y0, gm.u1, gm.v0),
-                (x0, y1, gm.u0, gm.v1),
-                (x1, y0, gm.u1, gm.v0),
-                (x1, y1, gm.u1, gm.v1),
-                (x0, y1, gm.u0, gm.v1),
-            ] {
-                verts.push(TV {
-                    x,
-                    y,
-                    u,
-                    v,
+            self.text_verts.extend_from_slice(&[
+                TV {
+                    x: x0,
+                    y: y0,
+                    u: gm.u0,
+                    v: gm.v0,
                     r,
                     g,
                     b,
                     a: alpha,
-                });
-            }
-        }
-
-        if verts.is_empty() {
-            return Ok(());
-        }
-
-        unsafe {
-            gl::UseProgram(self.prog_text);
-            uniform2f(self.prog_text, "uRes", self.win_w, self.win_h);
-            uniform1i(self.prog_text, "uAtlas", 0);
-            gl::ActiveTexture(gl::TEXTURE0);
-            gl::BindTexture(gl::TEXTURE_2D, self.atlas.texture);
-            upload_and_draw(self.vao_text, self.vbo_text, &verts, verts.len() as i32);
+                },
+                TV {
+                    x: x1,
+                    y: y0,
+                    u: gm.u1,
+                    v: gm.v0,
+                    r,
+                    g,
+                    b,
+                    a: alpha,
+                },
+                TV {
+                    x: x0,
+                    y: y1,
+                    u: gm.u0,
+                    v: gm.v1,
+                    r,
+                    g,
+                    b,
+                    a: alpha,
+                },
+                TV {
+                    x: x1,
+                    y: y0,
+                    u: gm.u1,
+                    v: gm.v0,
+                    r,
+                    g,
+                    b,
+                    a: alpha,
+                },
+                TV {
+                    x: x1,
+                    y: y1,
+                    u: gm.u1,
+                    v: gm.v1,
+                    r,
+                    g,
+                    b,
+                    a: alpha,
+                },
+                TV {
+                    x: x0,
+                    y: y1,
+                    u: gm.u0,
+                    v: gm.v1,
+                    r,
+                    g,
+                    b,
+                    a: alpha,
+                },
+            ]);
         }
         Ok(())
     }
@@ -692,27 +833,10 @@ unsafe fn upload_and_draw<T>(vao: GLuint, vbo: GLuint, data: &[T], count: i32) {
     }
 }
 
-unsafe fn uniform2f(prog: GLuint, name: &str, x: f32, y: f32) {
+unsafe fn get_uniform(prog: GLuint, name: &str) -> GLint {
     unsafe {
         let cname = CString::new(name).unwrap();
-        let loc = gl::GetUniformLocation(prog, cname.as_ptr());
-        gl::Uniform2f(loc, x, y);
-    }
-}
-
-unsafe fn uniform1i(prog: GLuint, name: &str, v: i32) {
-    unsafe {
-        let cname = CString::new(name).unwrap();
-        let loc = gl::GetUniformLocation(prog, cname.as_ptr());
-        gl::Uniform1i(loc, v);
-    }
-}
-
-unsafe fn uniform1f(prog: GLuint, name: &str, v: f32) {
-    unsafe {
-        let cname = CString::new(name).unwrap();
-        let loc = gl::GetUniformLocation(prog, cname.as_ptr());
-        gl::Uniform1f(loc, v);
+        gl::GetUniformLocation(prog, cname.as_ptr())
     }
 }
 

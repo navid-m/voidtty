@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     io::{ErrorKind, Read, Write},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
 };
@@ -226,6 +226,16 @@ impl Screen {
     /// Iterates over the rows currently visible in the viewport.
     pub fn display_rows(&self) -> impl Iterator<Item = &[Cell]> {
         (0..self.rows).map(move |row| self.display_row(row))
+    }
+
+    /// Copies the displayed rows into `out` so the renderer can work without
+    /// holding the screen lock. Reuses the buffers in `out` between frames.
+    pub fn copy_visible(&self, out: &mut Vec<Vec<Cell>>) {
+        out.resize_with(self.rows, Vec::new);
+        for (dst, src) in out.iter_mut().zip(self.display_rows()) {
+            dst.clear();
+            dst.extend_from_slice(src);
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -786,6 +796,8 @@ pub struct Pty {
     pub screen: Arc<Mutex<Screen>>,
     writer: SharedWriter,
     alive: Arc<AtomicBool>,
+    /// Set by the reader thread whenever the screen may have changed.
+    dirty: Arc<AtomicBool>,
 }
 
 impl Pty {
@@ -832,6 +844,8 @@ impl Pty {
         let writer_clone = Arc::clone(&writer);
         let alive = Arc::new(AtomicBool::new(true));
         let alive_clone = Arc::clone(&alive);
+        let dirty = Arc::new(AtomicBool::new(false));
+        let dirty_clone = Arc::clone(&dirty);
 
         thread::Builder::new()
             .name("pty-reader".into())
@@ -841,7 +855,7 @@ impl Pty {
                     screen: screen_clone,
                     writer: writer_clone,
                 };
-                let mut buf = [0u8; 4096];
+                let mut buf = [0u8; 16384];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
@@ -849,12 +863,14 @@ impl Pty {
                             for &byte in &buf[..n] {
                                 parser.advance(&mut performer, byte);
                             }
+                            dirty_clone.store(true, Ordering::Release);
                         }
                         Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                         Err(_) => break,
                     }
                 }
                 alive_clone.store(false, Ordering::SeqCst);
+                dirty_clone.store(true, Ordering::Release);
             })
             .context("spawning reader thread")?;
 
@@ -864,7 +880,13 @@ impl Pty {
             screen,
             writer,
             alive,
+            dirty,
         })
+    }
+
+    /// Returns whether the screen changed since the last call.
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
     }
 
     /// True while the child shell is still running.
