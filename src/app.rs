@@ -214,6 +214,8 @@ pub struct App {
     pub selection: Option<Selection>,
     /// Whether a mouse drag is currently extending the selection.
     pub selecting: bool,
+    /// Pane and xterm button code of a press forwarded to the running program.
+    pub mouse_pressed: Option<(usize, u8)>,
     next_pane_id: usize,
     next_accent: usize,
 }
@@ -230,6 +232,7 @@ impl App {
             scroll_drag: None,
             selection: None,
             selecting: false,
+            mouse_pressed: None,
             next_pane_id: 0,
             next_accent: 0,
         };
@@ -434,14 +437,7 @@ impl App {
         }
         let bracketed = self
             .pane(self.focused)
-            .map(|pane| {
-                pane.active()
-                    .pty
-                    .screen
-                    .lock()
-                    .unwrap()
-                    .bracketed_paste()
-            })
+            .map(|pane| pane.active().pty.screen.lock().unwrap().bracketed_paste())
             .unwrap_or(false);
 
         let payload = if bracketed {
@@ -450,7 +446,10 @@ impl App {
             text.replace("\r\n", "\r").replace('\n', "\r")
         };
         self.selection = None;
-        self.active_pane_mut().active_mut().pty.write(payload.as_bytes())
+        self.active_pane_mut()
+            .active_mut()
+            .pty
+            .write(payload.as_bytes())
     }
 
     /// Adjusts the font size by `delta` points, clamping to the allowed range

@@ -74,6 +74,22 @@ fn row_string(row: &[Cell]) -> String {
     s
 }
 
+/// Mouse reporting modes requested by the running program via DECSET.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseMode {
+    /// Mouse events stay inside the emulator (selection, scrollback).
+    #[default]
+    Off,
+    /// X10: button presses only.
+    X10,
+    /// DECSET 1000: presses and releases.
+    Normal,
+    /// DECSET 1002: presses, releases and drag motion.
+    Button,
+    /// DECSET 1003: presses, releases and all motion.
+    Any,
+}
+
 /// State saved while an alternate screen buffer is active. Full-screen programs
 /// such as Neovim and Helix switch to it and expect the normal screen (with the
 /// shell prompt) to come back untouched when they exit.
@@ -113,6 +129,10 @@ pub struct Screen {
     cursor_visible: bool,
     /// DECSET 2004 bracketed paste.
     bracketed_paste: bool,
+    /// Mouse reporting requested by the running program.
+    mouse_mode: MouseMode,
+    /// DECSET 1006 SGR mouse coordinate encoding.
+    mouse_sgr: bool,
     title: String,
 }
 
@@ -136,6 +156,8 @@ impl Screen {
             alt_screen: None,
             cursor_visible: true,
             bracketed_paste: false,
+            mouse_mode: MouseMode::Off,
+            mouse_sgr: false,
             title: "Terminal".to_owned(),
         }
     }
@@ -248,7 +270,11 @@ impl Screen {
 
     /// Extracts text between two display cells (inclusive), one line per row.
     pub fn text_between(&self, start: (usize, usize), end: (usize, usize)) -> String {
-        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
         let last_row = end.0.min(self.rows.saturating_sub(1));
         let mut lines: Vec<String> = Vec::new();
         for row in start.0.min(last_row)..=last_row {
@@ -548,6 +574,42 @@ impl Screen {
         self.bracketed_paste = enabled;
     }
 
+    /// Mouse reporting mode requested by the running program.
+    pub fn mouse_mode(&self) -> MouseMode {
+        self.mouse_mode
+    }
+
+    fn set_mouse_mode(&mut self, mode: MouseMode, enabled: bool) {
+        self.mouse_mode = if enabled { mode } else { MouseMode::Off };
+    }
+
+    fn set_mouse_sgr(&mut self, enabled: bool) {
+        self.mouse_sgr = enabled;
+    }
+
+    /// Encodes a mouse report for the program running in the pane.
+    ///
+    /// `code` is the xterm button code (with modifier bits and the motion bit
+    /// already applied), `col`/`row` are zero-based cell coordinates. Releases
+    /// use the legacy button-3 form unless SGR encoding was negotiated.
+    pub fn encode_mouse(&self, code: u8, col: usize, row: usize, release: bool) -> Vec<u8> {
+        let x = col + 1;
+        let y = row + 1;
+        if self.mouse_sgr {
+            let terminator = if release { 'm' } else { 'M' };
+            return format!("\x1b[<{code};{x};{y}{terminator}").into_bytes();
+        }
+        let code = if release { 3 } else { code };
+        vec![
+            b'\x1b',
+            b'[',
+            b'M',
+            32 + code.min(223),
+            32 + x.min(223) as u8,
+            32 + y.min(223) as u8,
+        ]
+    }
+
     /// Switches between the normal and alternate screen buffers. Entering saves
     /// the normal screen and optionally clears the alternate one; leaving
     /// restores the normal screen exactly as it was before the program started.
@@ -612,6 +674,8 @@ impl Screen {
         self.alt_screen = None;
         self.cursor_visible = true;
         self.bracketed_paste = false;
+        self.mouse_mode = MouseMode::Off;
+        self.mouse_sgr = false;
     }
 }
 
@@ -732,6 +796,11 @@ impl Perform for Performer {
                             }
                         }
                         2004 => screen.set_bracketed_paste(enable),
+                        9 => screen.set_mouse_mode(MouseMode::X10, enable),
+                        1000 => screen.set_mouse_mode(MouseMode::Normal, enable),
+                        1002 => screen.set_mouse_mode(MouseMode::Button, enable),
+                        1003 => screen.set_mouse_mode(MouseMode::Any, enable),
+                        1006 => screen.set_mouse_sgr(enable),
                         _ => {}
                     }
                 }
@@ -1086,6 +1155,37 @@ mod tests {
         feed(&mut parser, &mut performer, b"\x1b[?1049l");
         let screen = performer.screen.lock().unwrap();
         assert_eq!(screen.visible_lines()[0], "prompt");
+    }
+
+    #[test]
+    fn mouse_reporting_mode_and_sgr_encoding() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        let feed = |parser: &mut Parser, performer: &mut Performer, bytes: &[u8]| {
+            for byte in bytes {
+                parser.advance(performer, *byte);
+            }
+        };
+
+        feed(&mut parser, &mut performer, b"\x1b[?1002h\x1b[?1006h");
+        let screen = performer.screen.lock().unwrap();
+        assert_eq!(screen.mouse_mode(), MouseMode::Button);
+        assert_eq!(screen.encode_mouse(0, 4, 1, false), b"\x1b[<0;5;2M");
+        assert_eq!(screen.encode_mouse(0, 4, 1, true), b"\x1b[<0;5;2m");
+        drop(screen);
+
+        feed(&mut parser, &mut performer, b"\x1b[?1002l");
+        assert_eq!(
+            performer.screen.lock().unwrap().mouse_mode(),
+            MouseMode::Off
+        );
+    }
+
+    #[test]
+    fn mouse_encoding_falls_back_to_legacy_coordinates() {
+        let screen = Screen::new(20, 4, 100);
+        assert_eq!(screen.encode_mouse(0, 0, 0, false), b"\x1b[M\x20\x21\x21");
+        assert_eq!(screen.encode_mouse(0, 0, 0, true), b"\x1b[M\x23\x21\x21");
     }
 
     #[test]

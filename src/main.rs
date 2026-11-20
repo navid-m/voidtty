@@ -13,7 +13,7 @@ use std::env;
 use app::App;
 use config::Config;
 use renderer::Renderer;
-use terminal::{Cell, Color, Style};
+use terminal::{Cell, Color, MouseMode, Style};
 use ui::{Rect, UiMetrics, layout_rects, pane_content, text_cols, text_rows};
 
 const FALLBACK_FONT: &[u8] = include_bytes!("../assets/font.ttf");
@@ -163,10 +163,21 @@ fn process_events(
             }
             WindowEvent::Scroll(_, y) => {
                 let (mx, my) = window.get_cursor_pos();
+                let mx = mx as f32 * ui.scale;
+                let my = my as f32 * ui.scale;
                 let rects = pane_layout(app, renderer);
-                let id = ui::hit_pane(mx as f32 * ui.scale, my as f32 * ui.scale, &rects)
-                    .unwrap_or(app.focused);
-                if let Some(pane) = app.pane_mut(id) {
+                let id = ui::hit_pane(mx, my, &rects).unwrap_or(app.focused);
+                let mut reported = false;
+                if y != 0.0
+                    && pane_mouse_mode(app, id) != MouseMode::Off
+                    && let Some((_, rect)) = rects.iter().find(|(pane_id, _)| *pane_id == id)
+                {
+                    // xterm encodes the wheel as buttons 64 (up) and 65 (down).
+                    let code = if y > 0.0 { 64 } else { 65 };
+                    reported =
+                        send_mouse_report(app, id, *rect, renderer, ui, code, false, mx, my)?;
+                }
+                if !reported && let Some(pane) = app.pane_mut(id) {
                     pane.active_mut()
                         .pty
                         .screen
@@ -178,7 +189,9 @@ fn process_events(
                 redraw = true;
             }
             WindowEvent::CursorPos(x, y) => {
-                if app.selecting && let Some(mut selection) = app.selection {
+                if app.selecting
+                    && let Some(mut selection) = app.selection
+                {
                     let rects = pane_layout(app, renderer);
                     if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == selection.pane)
                         && let Some(pane) = app.pane(selection.pane)
@@ -218,21 +231,69 @@ fn process_events(
                             }
                         }
                     }
-                }
-            }
-            WindowEvent::MouseButton(_, glfw::Action::Release, _) => {
-                app.scroll_drag = None;
-                if app.selecting {
-                    app.selecting = false;
-                    if let Some(selection) = app.selection
-                        && selection.anchor == selection.cursor
-                    {
-                        app.selection = None;
-                        redraw = true;
+                } else {
+                    // Mouse motion reporting for programs that asked for it.
+                    let mx = x as f32 * ui.scale;
+                    let my = y as f32 * ui.scale;
+                    let rects = pane_layout(app, renderer);
+                    if let Some(id) = ui::hit_pane(mx, my, &rects) {
+                        let held = app
+                            .mouse_pressed
+                            .filter(|(pane_id, _)| *pane_id == id)
+                            .map(|(_, code)| code);
+                        let code = match (pane_mouse_mode(app, id), held) {
+                            (MouseMode::Any, Some(code)) => Some(32 + code),
+                            (MouseMode::Any, None) => Some(32 + 3),
+                            (MouseMode::Button, Some(code)) => Some(32 + code),
+                            _ => None,
+                        };
+                        if let Some(code) = code
+                            && let Some((_, rect)) =
+                                rects.iter().find(|(pane_id, _)| *pane_id == id)
+                        {
+                            send_mouse_report(app, id, *rect, renderer, ui, code, false, mx, my)?;
+                        }
                     }
                 }
             }
-            WindowEvent::MouseButton(button, glfw::Action::Press, _) => {
+            WindowEvent::MouseButton(_, glfw::Action::Release, mods) => {
+                let mut reported = false;
+                if let Some((id, code)) = app.mouse_pressed.take() {
+                    let mode = pane_mouse_mode(app, id);
+                    if mode != MouseMode::Off && mode != MouseMode::X10 {
+                        let (mx, my) = window.get_cursor_pos();
+                        let mx = mx as f32 * ui.scale;
+                        let my = my as f32 * ui.scale;
+                        let rects = pane_layout(app, renderer);
+                        if let Some((_, rect)) = rects.iter().find(|(pane_id, _)| *pane_id == id) {
+                            reported = send_mouse_report(
+                                app,
+                                id,
+                                *rect,
+                                renderer,
+                                ui,
+                                code + mouse_modifier_bits(mods),
+                                true,
+                                mx,
+                                my,
+                            )?;
+                        }
+                    }
+                }
+                if !reported {
+                    app.scroll_drag = None;
+                    if app.selecting {
+                        app.selecting = false;
+                        if let Some(selection) = app.selection
+                            && selection.anchor == selection.cursor
+                        {
+                            app.selection = None;
+                            redraw = true;
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseButton(button, glfw::Action::Press, mods) => {
                 let (mx, my) = window.get_cursor_pos();
                 let mx = mx as f32 * ui.scale;
                 let my = my as f32 * ui.scale;
@@ -275,12 +336,43 @@ fn process_events(
                         Some(id) => {
                             app.focused = id;
                             redraw = true;
-                            if button == glfw::MouseButton::Button1 {
+                            let mut reported = false;
+                            if let Some(code) = mouse_button_code(button)
+                                && !mods.contains(glfw::Modifiers::Shift)
+                                && let Some((_, rect)) =
+                                    rects.iter().find(|(pane_id, _)| *pane_id == id)
+                            {
+                                let mode = pane_mouse_mode(app, id);
+                                if mode != MouseMode::Off {
+                                    reported = send_mouse_report(
+                                        app,
+                                        id,
+                                        *rect,
+                                        renderer,
+                                        ui,
+                                        code + mouse_modifier_bits(mods),
+                                        false,
+                                        mx,
+                                        my,
+                                    )?;
+                                    // X10 reports presses only; remember the button for
+                                    // release and drag motion otherwise.
+                                    if reported && mode != MouseMode::X10 {
+                                        app.mouse_pressed = Some((id, code));
+                                    }
+                                }
+                            }
+                            if reported {
                                 app.selection = None;
                                 app.selecting = false;
-                                if let Some(rect) =
-                                    rects.iter().find(|(pane_id, _)| *pane_id == id)
-                                        .map(|(_, rect)| *rect)
+                            }
+                            if !reported && button == glfw::MouseButton::Button1 {
+                                app.selection = None;
+                                app.selecting = false;
+                                if let Some(rect) = rects
+                                    .iter()
+                                    .find(|(pane_id, _)| *pane_id == id)
+                                    .map(|(_, rect)| *rect)
                                     && let Some(pane) = app.pane(id)
                                 {
                                     let content = pane_content(rect, ui.tab_bar_h);
@@ -361,6 +453,88 @@ fn cell_at(
         row.clamp(0.0, (rows - 1) as f32) as usize,
         col.clamp(0.0, (cols - 1) as f32) as usize,
     ))
+}
+
+/// xterm button code for a physical mouse button (wheels use `Scroll` events).
+fn mouse_button_code(button: glfw::MouseButton) -> Option<u8> {
+    match button {
+        glfw::MouseButton::Button1 => Some(0),
+        // GLFW numbers right before middle; xterm numbers middle before right.
+        glfw::MouseButton::Button2 => Some(2),
+        glfw::MouseButton::Button3 => Some(1),
+        _ => None,
+    }
+}
+
+fn mouse_modifier_bits(mods: glfw::Modifiers) -> u8 {
+    let mut bits = 0;
+    if mods.contains(glfw::Modifiers::Shift) {
+        bits |= 4;
+    }
+    if mods.contains(glfw::Modifiers::Alt) {
+        bits |= 8;
+    }
+    if mods.contains(glfw::Modifiers::Control) {
+        bits |= 16;
+    }
+    bits
+}
+
+fn pane_mouse_mode(app: &App, id: usize) -> MouseMode {
+    app.pane(id)
+        .map(|pane| pane.active().pty.screen.lock().unwrap().mouse_mode())
+        .unwrap_or(MouseMode::Off)
+}
+
+/// Forwards one mouse event to the program in pane `id`. Returns whether the
+/// program accepted it (reporting enabled and the pointer is over its grid).
+fn send_mouse_report(
+    app: &mut App,
+    id: usize,
+    rect: Rect,
+    renderer: &Renderer,
+    ui: UiMetrics,
+    code: u8,
+    release: bool,
+    mx: f32,
+    my: f32,
+) -> Result<bool> {
+    let Some(pane) = app.pane(id) else {
+        return Ok(false);
+    };
+    let content = pane_content(rect, ui.tab_bar_h);
+    if mx < content.x
+        || mx >= content.x + content.w
+        || my < content.y
+        || my >= content.y + content.h
+    {
+        return Ok(false);
+    }
+    let Some((row, col)) = cell_at(
+        pane,
+        rect,
+        ui,
+        renderer.cell_w(),
+        renderer.line_height(),
+        mx,
+        my,
+    ) else {
+        return Ok(false);
+    };
+    let bytes = {
+        let screen = pane.active().pty.screen.lock().unwrap();
+        match screen.mouse_mode() {
+            MouseMode::Off => return Ok(false),
+            // X10 has no release events.
+            MouseMode::X10 if release => return Ok(false),
+            _ => {}
+        }
+        screen.encode_mouse(code, col, row, release)
+    };
+    if let Some(pane) = app.pane_mut(id) {
+        pane.active_mut().pty.write(&bytes)?;
+    }
+    Ok(true)
 }
 
 /// Dark blue / red / black-leaning palette used for tab indicators.
@@ -591,11 +765,7 @@ fn draw_pane(
         if let Some(selection) = selection {
             let (start, end) = selection.range();
             if row >= start.0 && row <= end.0 {
-                let end_col = if row == end.0 {
-                    end.1 + 1
-                } else {
-                    cells.len()
-                };
+                let end_col = if row == end.0 { end.1 + 1 } else { cells.len() };
                 last = last.max(end_col.min(cells.len()));
             }
         }
