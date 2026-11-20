@@ -4,7 +4,11 @@ use glfw::{Action, Key, Modifiers, WindowEvent};
 use crate::app::{App, SplitDir};
 
 /// Processes one GLFW window event. Returns `true` if consumed as a shortcut.
-pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
+pub fn handle_event(
+    event: WindowEvent,
+    app: &mut App,
+    clipboard: &mut Option<arboard::Clipboard>,
+) -> Result<bool> {
     let WindowEvent::Key(key, _, action, mods) = event else {
         return Ok(false);
     };
@@ -72,6 +76,22 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
                 app.prev_tab();
                 return Ok(true);
             }
+            Key::C => {
+                if let Some(text) = app.copy_selection()
+                    && let Some(clipboard) = clipboard.as_mut()
+                {
+                    let _ = clipboard.set_text(text);
+                }
+                return Ok(true);
+            }
+            Key::V => {
+                if let Some(clipboard) = clipboard.as_mut()
+                    && let Ok(text) = clipboard.get_text()
+                {
+                    app.paste(&text)?;
+                }
+                return Ok(true);
+            }
             Key::Q => {
                 app.running = false;
                 return Ok(true);
@@ -123,6 +143,7 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
     };
 
     if !bytes.is_empty() {
+        app.selection = None;
         app.active_pane_mut().active_mut().pty.write(&bytes)?;
     }
     Ok(false)
@@ -130,6 +151,7 @@ pub fn handle_event(event: WindowEvent, app: &mut App) -> Result<bool> {
 
 /// Handles a Unicode character event from GLFW (fires for printable chars).
 pub fn handle_char(c: char, app: &mut App) -> Result<()> {
+    app.selection = None;
     let mut buf = [0u8; 4];
     let s = c.encode_utf8(&mut buf);
     app.active_pane_mut().active_mut().pty.write(s.as_bytes())

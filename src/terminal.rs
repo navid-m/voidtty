@@ -111,6 +111,8 @@ pub struct Screen {
     alt_screen: Option<SavedScreen>,
     /// DECTCEM cursor visibility (`CSI ?25h` / `CSI ?25l`).
     cursor_visible: bool,
+    /// DECSET 2004 bracketed paste.
+    bracketed_paste: bool,
     title: String,
 }
 
@@ -133,6 +135,7 @@ impl Screen {
             current_style: Style::default(),
             alt_screen: None,
             cursor_visible: true,
+            bracketed_paste: false,
             title: "Terminal".to_owned(),
         }
     }
@@ -159,6 +162,11 @@ impl Screen {
     /// Number of rows in the viewport.
     pub fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// Number of columns in the viewport.
+    pub fn cols(&self) -> usize {
+        self.cols
     }
 
     /// Cursor position as `(row, col)` within the live grid.
@@ -236,6 +244,37 @@ impl Screen {
             dst.clear();
             dst.extend_from_slice(src);
         }
+    }
+
+    /// Extracts text between two display cells (inclusive), one line per row.
+    pub fn text_between(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        let last_row = end.0.min(self.rows.saturating_sub(1));
+        let mut lines: Vec<String> = Vec::new();
+        for row in start.0.min(last_row)..=last_row {
+            let cells = self.display_row(row);
+            if cells.is_empty() {
+                lines.push(String::new());
+                continue;
+            }
+            let first = if row == start.0 {
+                start.1.min(cells.len() - 1)
+            } else {
+                0
+            };
+            let last = if row == end.0 {
+                end.1.min(cells.len() - 1)
+            } else {
+                cells.len() - 1
+            };
+            if last < first {
+                lines.push(String::new());
+                continue;
+            }
+            let line: String = cells[first..=last].iter().map(|cell| cell.ch).collect();
+            lines.push(line.trim_end().to_owned());
+        }
+        lines.join("\n")
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -501,6 +540,14 @@ impl Screen {
         self.cursor_visible = visible;
     }
 
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    fn set_bracketed_paste(&mut self, enabled: bool) {
+        self.bracketed_paste = enabled;
+    }
+
     /// Switches between the normal and alternate screen buffers. Entering saves
     /// the normal screen and optionally clears the alternate one; leaving
     /// restores the normal screen exactly as it was before the program started.
@@ -564,6 +611,7 @@ impl Screen {
         self.current_style = Style::default();
         self.alt_screen = None;
         self.cursor_visible = true;
+        self.bracketed_paste = false;
     }
 }
 
@@ -683,6 +731,7 @@ impl Perform for Performer {
                                 screen.restore_cursor();
                             }
                         }
+                        2004 => screen.set_bracketed_paste(enable),
                         _ => {}
                     }
                 }

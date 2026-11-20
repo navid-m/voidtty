@@ -174,6 +174,30 @@ fn remove_leaf(node: LayoutNode, target: usize) -> (Option<LayoutNode>, bool) {
     }
 }
 
+/// A text selection within one pane, stored in display-grid coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub pane: usize,
+    pub anchor: (usize, usize),
+    pub cursor: (usize, usize),
+}
+
+impl Selection {
+    /// Selection endpoints ordered top-left to bottom-right.
+    pub fn range(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    pub fn contains(&self, row: usize, col: usize) -> bool {
+        let (start, end) = self.range();
+        (row, col) >= start && (row, col) <= end
+    }
+}
+
 /// Root application state.
 pub struct App {
     pub panes: Vec<Pane>,
@@ -186,6 +210,10 @@ pub struct App {
     pub needs_resize: bool,
     /// Pane whose scrollbar thumb is currently being dragged.
     pub scroll_drag: Option<usize>,
+    /// Active text selection.
+    pub selection: Option<Selection>,
+    /// Whether a mouse drag is currently extending the selection.
+    pub selecting: bool,
     next_pane_id: usize,
     next_accent: usize,
 }
@@ -200,6 +228,8 @@ impl App {
             running: true,
             needs_resize: false,
             scroll_drag: None,
+            selection: None,
+            selecting: false,
             next_pane_id: 0,
             next_accent: 0,
         };
@@ -243,6 +273,7 @@ impl App {
         if let Some(pane) = self.pane_mut(self.focused) {
             pane.add_tab(&config, accent)?;
         }
+        self.selection = None;
         self.needs_resize = true;
         Ok(())
     }
@@ -262,12 +293,14 @@ impl App {
             self.layout = Some(LayoutNode::Leaf(id));
         }
         self.focused = id;
+        self.selection = None;
         self.needs_resize = true;
         Ok(())
     }
 
     /// Closes the focused pane's active tab, or the pane when it was the last.
     pub fn close_tab(&mut self) {
+        self.selection = None;
         let Some(pane) = self.pane(self.focused) else {
             return;
         };
@@ -282,6 +315,7 @@ impl App {
 
     /// Closes the focused pane (and all of its tabs).
     pub fn close_focused_pane(&mut self) {
+        self.selection = None;
         let id = self.focused;
         if self.panes.len() <= 1 {
             self.panes.clear();
@@ -342,12 +376,14 @@ impl App {
     }
 
     pub fn next_tab(&mut self) {
+        self.selection = None;
         if let Some(pane) = self.pane_mut(self.focused) {
             pane.next_tab();
         }
     }
 
     pub fn prev_tab(&mut self) {
+        self.selection = None;
         if let Some(pane) = self.pane_mut(self.focused) {
             pane.prev_tab();
         }
@@ -364,6 +400,7 @@ impl App {
     }
 
     fn cycle_pane(&mut self, step: isize) {
+        self.selection = None;
         let Some(layout) = self.layout.as_ref() else {
             return;
         };
@@ -378,6 +415,42 @@ impl App {
         };
         let len = order.len() as isize;
         self.focused = order[(index as isize + step).rem_euclid(len) as usize];
+    }
+
+    /// Returns the text covered by the current selection, if any.
+    pub fn copy_selection(&self) -> Option<String> {
+        let selection = self.selection?;
+        let pane = self.pane(selection.pane)?;
+        let (start, end) = selection.range();
+        let screen = pane.active().pty.screen.lock().unwrap();
+        Some(screen.text_between(start, end))
+    }
+
+    /// Sends pasted text to the focused terminal, respecting bracketed paste.
+    pub fn paste(&mut self, text: &str) -> Result<()> {
+        let text = text.replace('\0', "");
+        if text.is_empty() {
+            return Ok(());
+        }
+        let bracketed = self
+            .pane(self.focused)
+            .map(|pane| {
+                pane.active()
+                    .pty
+                    .screen
+                    .lock()
+                    .unwrap()
+                    .bracketed_paste()
+            })
+            .unwrap_or(false);
+
+        let payload = if bracketed {
+            format!("\x1b[200~{}\x1b[201~", text.replace("\r\n", "\n"))
+        } else {
+            text.replace("\r\n", "\r").replace('\n', "\r")
+        };
+        self.selection = None;
+        self.active_pane_mut().active_mut().pty.write(payload.as_bytes())
     }
 
     /// Adjusts the font size by `delta` points, clamping to the allowed range

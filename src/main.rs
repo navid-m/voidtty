@@ -85,6 +85,7 @@ fn main() -> Result<()> {
     ui = ui.with_tab_bar_height(renderer.line_height());
 
     let mut app = App::new(config)?;
+    let mut clipboard = arboard::Clipboard::new().ok();
 
     // Size the PTY grids to the actual panes before the first frame.
     resize_ptys(&mut app, &renderer, ui);
@@ -99,7 +100,14 @@ fn main() -> Result<()> {
             glfw.wait_events_timeout(0.002);
         }
 
-        let events_changed = process_events(&events, &mut window, &mut app, &mut renderer, ui)?;
+        let events_changed = process_events(
+            &events,
+            &mut window,
+            &mut app,
+            &mut renderer,
+            ui,
+            &mut clipboard,
+        )?;
         app.reap_exited_panes();
         if !app.running {
             break;
@@ -138,6 +146,7 @@ fn process_events(
     app: &mut App,
     renderer: &mut Renderer,
     ui: UiMetrics,
+    clipboard: &mut Option<arboard::Clipboard>,
 ) -> Result<bool> {
     let mut redraw = false;
     for (_, event) in glfw::flush_messages(events) {
@@ -145,6 +154,7 @@ fn process_events(
             WindowEvent::FramebufferSize(w, h) => {
                 renderer.resize(w as u32, h as u32);
                 resize_ptys(app, renderer, ui);
+                app.selection = None;
                 redraw = true;
             }
             WindowEvent::Char(c) => {
@@ -164,10 +174,30 @@ fn process_events(
                         .unwrap()
                         .scroll_by_lines(y as f32);
                 }
+                app.selection = None;
                 redraw = true;
             }
             WindowEvent::CursorPos(x, y) => {
-                if let Some(id) = app.scroll_drag {
+                if app.selecting && let Some(mut selection) = app.selection {
+                    let rects = pane_layout(app, renderer);
+                    if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == selection.pane)
+                        && let Some(pane) = app.pane(selection.pane)
+                        && let Some(cell) = cell_at(
+                            pane,
+                            *rect,
+                            ui,
+                            renderer.cell_w(),
+                            renderer.line_height(),
+                            x as f32 * ui.scale,
+                            y as f32 * ui.scale,
+                        )
+                        && cell != selection.cursor
+                    {
+                        selection.cursor = cell;
+                        app.selection = Some(selection);
+                        redraw = true;
+                    }
+                } else if let Some(id) = app.scroll_drag {
                     let rects = pane_layout(app, renderer);
                     if let Some((_, rect)) = rects.iter().find(|(pane_id, _)| *pane_id == id) {
                         let content = pane_content(*rect, ui.tab_bar_h);
@@ -189,12 +219,20 @@ fn process_events(
                         }
                     }
                 }
-                let _ = x;
             }
             WindowEvent::MouseButton(_, glfw::Action::Release, _) => {
                 app.scroll_drag = None;
+                if app.selecting {
+                    app.selecting = false;
+                    if let Some(selection) = app.selection
+                        && selection.anchor == selection.cursor
+                    {
+                        app.selection = None;
+                        redraw = true;
+                    }
+                }
             }
-            WindowEvent::MouseButton(_, glfw::Action::Press, _) => {
+            WindowEvent::MouseButton(button, glfw::Action::Press, _) => {
                 let (mx, my) = window.get_cursor_pos();
                 let mx = mx as f32 * ui.scale;
                 let my = my as f32 * ui.scale;
@@ -225,19 +263,61 @@ fn process_events(
                             .set_scroll_offset(offset);
                         app.focused = *id;
                         app.scroll_drag = Some(*id);
+                        app.selection = None;
                         grabbed_scrollbar = true;
                         redraw = true;
                         break;
                     }
                 }
 
-                if !grabbed_scrollbar && let Some(id) = ui::hit_pane(mx, my, &rects) {
-                    app.focused = id;
-                    redraw = true;
+                if !grabbed_scrollbar {
+                    match ui::hit_pane(mx, my, &rects) {
+                        Some(id) => {
+                            app.focused = id;
+                            redraw = true;
+                            if button == glfw::MouseButton::Button1 {
+                                app.selection = None;
+                                app.selecting = false;
+                                if let Some(rect) =
+                                    rects.iter().find(|(pane_id, _)| *pane_id == id)
+                                        .map(|(_, rect)| *rect)
+                                    && let Some(pane) = app.pane(id)
+                                {
+                                    let content = pane_content(rect, ui.tab_bar_h);
+                                    let inside = mx >= content.x
+                                        && mx < content.x + content.w
+                                        && my >= content.y
+                                        && my < content.y + content.h;
+                                    if inside
+                                        && let Some(cell) = cell_at(
+                                            pane,
+                                            rect,
+                                            ui,
+                                            renderer.cell_w(),
+                                            renderer.line_height(),
+                                            mx,
+                                            my,
+                                        )
+                                    {
+                                        app.selection = Some(app::Selection {
+                                            pane: id,
+                                            anchor: cell,
+                                            cursor: cell,
+                                        });
+                                        app.selecting = true;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            app.selection = None;
+                            redraw = true;
+                        }
+                    }
                 }
             }
             ev => {
-                input::handle_event(ev, app)?;
+                input::handle_event(ev, app, clipboard)?;
                 redraw = true;
             }
         }
@@ -252,6 +332,35 @@ fn pane_layout(app: &App, renderer: &Renderer) -> Vec<(usize, Rect)> {
         .as_ref()
         .map(|layout| layout_rects(layout, area))
         .unwrap_or_default()
+}
+
+/// Maps a window position to a cell in the pane's displayed grid.
+fn cell_at(
+    pane: &app::Pane,
+    rect: Rect,
+    ui: UiMetrics,
+    cell_w: f32,
+    line_h: f32,
+    mx: f32,
+    my: f32,
+) -> Option<(usize, usize)> {
+    if cell_w <= 0.0 || line_h <= 0.0 {
+        return None;
+    }
+    let content = pane_content(rect, ui.tab_bar_h);
+    let (rows, cols) = {
+        let screen = pane.active().pty.screen.lock().unwrap();
+        (screen.rows(), screen.cols())
+    };
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    let col = ((mx - content.x - ui.pane_pad) / cell_w).floor();
+    let row = ((my - content.y - ui.pane_pad) / line_h).floor();
+    Some((
+        row.clamp(0.0, (rows - 1) as f32) as usize,
+        col.clamp(0.0, (cols - 1) as f32) as usize,
+    ))
 }
 
 /// Dark blue / red / black-leaning palette used for tab indicators.
@@ -272,6 +381,8 @@ fn tab_color(accent: usize, active: bool) -> (f32, f32, f32) {
 
 const DEFAULT_FG: (f32, f32, f32) = (0.90, 0.90, 0.90);
 const DEFAULT_BG: (f32, f32, f32) = (0.0, 0.0, 0.0);
+const SELECTION_FG: (f32, f32, f32) = (0.95, 0.95, 1.0);
+const SELECTION_BG: (f32, f32, f32) = (0.20, 0.34, 0.58);
 
 const ANSI_COLORS: [[f32; 3]; 16] = [
     [0.00, 0.00, 0.00],
@@ -396,6 +507,7 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     for (id, rect) in pane_layout(app, renderer) {
         let Some(pane) = app.pane(id) else { continue };
+        let selection = app.selection.filter(|selection| selection.pane == id);
         draw_pane(
             renderer,
             pane,
@@ -404,6 +516,7 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
             ui,
             opacity,
             &mut rows,
+            selection,
         )?;
     }
 
@@ -419,6 +532,7 @@ fn draw_pane(
     ui: UiMetrics,
     opacity: f32,
     rows: &mut Vec<Vec<Cell>>,
+    selection: Option<app::Selection>,
 ) -> Result<()> {
     // Pane background.
     renderer.draw_rect(rect.x, rect.y, rect.w, rect.h, 0.0, 0.0, 0.0, opacity);
@@ -473,6 +587,18 @@ fn draw_pane(
         if let Some(col) = cursor_cell {
             last = last.max(col + 1);
         }
+        // Extend the row to cover a selection even across blank cells.
+        if let Some(selection) = selection {
+            let (start, end) = selection.range();
+            if row >= start.0 && row <= end.0 {
+                let end_col = if row == end.0 {
+                    end.1 + 1
+                } else {
+                    cells.len()
+                };
+                last = last.max(end_col.min(cells.len()));
+            }
+        }
         if last == 0 {
             continue;
         }
@@ -505,7 +631,12 @@ fn draw_pane(
             } else {
                 cell.style
             };
-            let (fg, bg, fill) = cell_colors(style);
+            let selected = selection.is_some_and(|selection| selection.contains(row, col));
+            let (fg, bg, fill) = if selected {
+                (SELECTION_FG, SELECTION_BG, true)
+            } else {
+                cell_colors(style)
+            };
             if fill {
                 if run_start.is_some() && run_color == bg {
                     // The run continues.
