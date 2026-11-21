@@ -153,7 +153,7 @@ impl GlyphAtlas {
         let mut glyphs: HashMap<u16, GlyphMetrics> = HashMap::new();
 
         let ascent = line_metrics
-            .map(|m| m.ascent)
+            .map(|m| m.ascent.round())
             .unwrap_or_else(|| font.rasterize('M', font_size).0.height as f32);
 
         for (i, &id) in glyph_ids.iter().enumerate() {
@@ -864,13 +864,16 @@ impl Renderer {
 
             let (r, g, b) = colors.get(rg.cell).copied().unwrap_or(fallback_color);
             let cell_x = px + rg.cell as f32 * cell_w;
+            // Snap to the pixel grid: fractional origins make linear filtering
+            // blend a whole extra texel row, which looks like a fuzzy outline.
             let x0 = if rg.face == 0 {
                 cell_x + rg.x_offset + gm.xoff
             } else {
                 // Fallback faces are proportional; centre their advance in the cell.
                 cell_x + (cell_w - gm.advance).max(0.0) * 0.5 + gm.xoff
-            };
-            let y0 = baseline - gm.bh - gm.yoff - rg.y_offset;
+            }
+            .round();
+            let y0 = (baseline - gm.bh - gm.yoff - rg.y_offset).round();
             let x1 = x0 + gm.bw;
             let y1 = y0 + gm.bh;
 
