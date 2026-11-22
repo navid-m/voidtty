@@ -52,12 +52,20 @@ pub fn handle_event(
                 app.close_tab();
                 return Ok(true);
             }
-            Key::Right => {
-                app.next_tab();
+            Key::Left => {
+                app.resize_focused(SplitDir::Horizontal, 0.05);
                 return Ok(true);
             }
-            Key::Left => {
-                app.prev_tab();
+            Key::Right => {
+                app.resize_focused(SplitDir::Horizontal, -0.05);
+                return Ok(true);
+            }
+            Key::Up => {
+                app.resize_focused(SplitDir::Vertical, 0.05);
+                return Ok(true);
+            }
+            Key::Down => {
+                app.resize_focused(SplitDir::Vertical, -0.05);
                 return Ok(true);
             }
             Key::LeftBracket => {

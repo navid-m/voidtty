@@ -66,6 +66,10 @@ fn main() -> Result<()> {
     window.set_mouse_button_polling(true);
     window.set_scroll_polling(true);
     window.set_cursor_pos_polling(true);
+    // Repaint when X11/compositor asks for it (expose, unminimise, focus).
+    window.set_refresh_polling(true);
+    window.set_focus_polling(true);
+    window.set_iconify_polling(true);
     // Draw only when something changes and present immediately, so keystroke
     // echo is not held back until the next vertical blank.
     glfw.set_swap_interval(glfw::SwapInterval::None);
@@ -91,6 +95,7 @@ fn main() -> Result<()> {
     resize_ptys(&mut app, &renderer, ui);
 
     let mut redraw = true;
+    let mut was_iconified = window.is_iconified();
     while !window.should_close() && app.running {
         if redraw {
             glfw.poll_events();
@@ -130,7 +135,21 @@ fn main() -> Result<()> {
             .iter()
             .any(|pane| pane.tabs.iter().any(|tab| tab.pty.take_dirty()));
 
-        redraw = events_changed || output_changed || layout_changed;
+        // Some window managers do not deliver an expose event on unminimise, so
+        // watch the iconified state as well and repaint when it clears.
+        let iconified = window.is_iconified();
+        let restored = was_iconified && !iconified;
+        was_iconified = iconified;
+        if restored {
+            // Re-sync in case the WM skipped the framebuffer-size event.
+            let (fw, fh) = window.get_framebuffer_size();
+            if fw > 0 && fh > 0 && (fw as f32 != renderer.win_w || fh as f32 != renderer.win_h) {
+                renderer.resize(fw as u32, fh as u32);
+                resize_ptys(&mut app, &renderer, ui);
+            }
+        }
+
+        redraw = events_changed || output_changed || layout_changed || restored;
         if redraw {
             draw_frame(&mut renderer, &app, ui)?;
             window.swap_buffers();
@@ -151,11 +170,20 @@ fn process_events(
     let mut redraw = false;
     for (_, event) in glfw::flush_messages(events) {
         match event {
-            WindowEvent::FramebufferSize(w, h) => {
-                renderer.resize(w as u32, h as u32);
-                resize_ptys(app, renderer, ui);
-                app.selection = None;
+            WindowEvent::Refresh | WindowEvent::Focus(true) | WindowEvent::Iconify(false) => {
+                // The compositor may have discarded the back buffer while the
+                // window was hidden or iconified; force a full repaint.
                 redraw = true;
+            }
+            WindowEvent::FramebufferSize(w, h) => {
+                // Minimising can report a zero-sized framebuffer on X11; keep
+                // the last real size instead of collapsing every pane.
+                if w > 0 && h > 0 {
+                    renderer.resize(w as u32, h as u32);
+                    resize_ptys(app, renderer, ui);
+                    app.selection = None;
+                    redraw = true;
+                }
             }
             WindowEvent::Char(c) => {
                 input::handle_char(c, app)?;

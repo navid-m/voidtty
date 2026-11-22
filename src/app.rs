@@ -136,6 +136,38 @@ impl LayoutNode {
         }
     }
 
+    /// Adjusts the nearest split of `axis` containing `target`. Returns
+    /// `(contains_target, adjusted)`.
+    fn adjust_ratio_for_leaf(&mut self, target: usize, axis: SplitDir, delta: f32) -> (bool, bool) {
+        match self {
+            LayoutNode::Leaf(id) => (*id == target, false),
+            LayoutNode::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                let (in_first, adjusted) = first.adjust_ratio_for_leaf(target, axis, delta);
+                if in_first {
+                    if !adjusted && *dir == axis {
+                        *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                        return (true, true);
+                    }
+                    return (true, adjusted);
+                }
+                let (in_second, adjusted) = second.adjust_ratio_for_leaf(target, axis, delta);
+                if in_second {
+                    if !adjusted && *dir == axis {
+                        *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                        return (true, true);
+                    }
+                    return (true, adjusted);
+                }
+                (false, false)
+            }
+        }
+    }
+
     /// Appends pane ids in visual/layout order (depth-first, left-to-right).
     fn leaf_ids(&self, out: &mut Vec<usize>) {
         match self {
@@ -337,6 +369,19 @@ impl App {
         self.selection = None;
         self.needs_resize = true;
         Ok(())
+    }
+
+    /// Grows (positive `delta`) or shrinks the focused side of the nearest
+    /// split along `axis`. The ratio is that of the first child (left/top).
+    pub fn resize_focused(&mut self, axis: SplitDir, delta: f32) {
+        let focused = self.focused;
+        let Some(layout) = self.layout.as_mut() else {
+            return;
+        };
+        let (_, adjusted) = layout.adjust_ratio_for_leaf(focused, axis, delta);
+        if adjusted {
+            self.needs_resize = true;
+        }
     }
 
     /// Closes the focused pane's active tab, or the pane when it was the last.
@@ -545,6 +590,28 @@ mod tests {
         };
         assert!((ratio - 0.7).abs() < f32::EPSILON);
         assert!(!node.set_ratio(&[true, true], 0.5));
+    }
+
+    #[test]
+    fn adjust_ratio_uses_nearest_split_on_the_requested_axis() {
+        let mut node = LayoutNode::Leaf(0);
+        node.split_leaf(0, SplitDir::Horizontal, 1);
+        node.split_leaf(1, SplitDir::Vertical, 2);
+
+        assert!(node.adjust_ratio_for_leaf(2, SplitDir::Vertical, 0.1).1);
+        let LayoutNode::Split { second, .. } = &node else {
+            panic!("root should be a split");
+        };
+        let LayoutNode::Split { ratio, .. } = second.as_ref() else {
+            panic!("second child should be a split");
+        };
+        assert!(ratio > &0.5);
+
+        assert!(node.adjust_ratio_for_leaf(2, SplitDir::Horizontal, 0.1).1);
+        let LayoutNode::Split { ratio, .. } = &node else {
+            panic!("root should be a split");
+        };
+        assert!(ratio > &0.5);
     }
 
     #[test]
