@@ -96,6 +96,7 @@ pub enum MouseMode {
 #[derive(Clone)]
 struct SavedScreen {
     grid: Vec<Vec<Cell>>,
+    grid_wrapped: Vec<bool>,
     cursor_row: usize,
     cursor_col: usize,
     saved_row: usize,
@@ -112,6 +113,9 @@ pub struct Screen {
     cols: usize,
     rows: usize,
     grid: Vec<Vec<Cell>>,
+    /// `grid_wrapped[row]` is true when the logical line continues on the next
+    /// row, so column resizes can reflow wrapped text instead of truncating it.
+    grid_wrapped: Vec<bool>,
     cursor_row: usize,
     cursor_col: usize,
     saved_row: usize,
@@ -144,6 +148,7 @@ impl Screen {
             cols,
             rows,
             grid: vec![vec![Cell::default(); cols]; rows],
+            grid_wrapped: vec![false; rows],
             cursor_row: 0,
             cursor_col: 0,
             saved_row: 0,
@@ -308,28 +313,154 @@ impl Screen {
         let rows = rows.max(1);
 
         if cols != self.cols {
-            for row in &mut self.grid {
-                row.resize(cols, Cell::default());
-            }
-            self.cols = cols;
+            self.reflow(cols);
         }
 
         if rows < self.rows {
             let removed = self.rows - rows;
             for _ in 0..removed.min(self.grid.len()) {
                 let line = self.grid.remove(0);
+                if !self.grid_wrapped.is_empty() {
+                    self.grid_wrapped.remove(0);
+                }
                 self.push_scrollback(line);
             }
             self.cursor_row = self.cursor_row.saturating_sub(removed);
+            if let Some(last) = self.grid_wrapped.last_mut() {
+                *last = false;
+            }
         } else if rows > self.rows {
             self.grid
                 .resize_with(rows, || vec![Cell::default(); self.cols]);
+            self.grid_wrapped.resize(rows, false);
         }
         self.rows = rows;
+        self.grid_wrapped.resize(self.rows, false);
 
         self.cursor_row = self.cursor_row.min(self.rows - 1);
         self.cursor_col = self.cursor_col.min(self.cols - 1);
         self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+    }
+
+    /// Rewraps the visible grid at a new column count. Soft-wrapped logical
+    /// lines are re-flowed, and any rows that no longer fit move to scrollback
+    /// instead of being truncated. (Scrollback keeps its original line breaks.)
+    fn reflow(&mut self, new_cols: usize) {
+        if new_cols == self.cols || self.grid.is_empty() {
+            return;
+        }
+        let old_grid = std::mem::take(&mut self.grid);
+        let old_wrapped = std::mem::take(&mut self.grid_wrapped);
+        let old_cursor_row = self.cursor_row;
+        let old_cursor_col = self.cursor_col;
+
+        let mut rows: Vec<Vec<Cell>> = Vec::new();
+        let mut wraps: Vec<bool> = Vec::new();
+        let mut cursor = (
+            old_cursor_row.min(old_grid.len().saturating_sub(1)),
+            old_cursor_col,
+        );
+
+        // Trailing blank rows are just empty viewport space, not extra logical
+        // lines; keeping them would make reflow push real content off the top.
+        let mut end = old_grid.len();
+        while end > 0 {
+            let blank = old_grid[end - 1]
+                .iter()
+                .all(|c| c.ch == ' ' && c.style == Style::default());
+            if !blank {
+                break;
+            }
+            end -= 1;
+        }
+        end = end.max(old_cursor_row + 1).min(old_grid.len());
+
+        let mut i = 0;
+        while i < end {
+            let line_start = rows.len();
+            let mut cells: Vec<Cell> = Vec::new();
+            let mut cursor_offset = None;
+            loop {
+                let row = &old_grid[i];
+                let wrapped = old_wrapped.get(i).copied().unwrap_or(false);
+                let is_cursor = i == old_cursor_row;
+                let content_len = if wrapped {
+                    row.len()
+                } else {
+                    row.iter()
+                        .rposition(|c| c.ch != ' ' || c.style != Style::default())
+                        .map(|n| n + 1)
+                        .unwrap_or(0)
+                };
+                let mut len = content_len;
+                if is_cursor {
+                    let col = old_cursor_col.min(row.len());
+                    cursor_offset = Some(cells.len() + col);
+                    len = len.max(col);
+                }
+                cells.extend_from_slice(&row[..len.min(row.len())]);
+                i += 1;
+                if !wrapped || i >= end {
+                    break;
+                }
+            }
+
+            let chunks = if cells.is_empty() {
+                0
+            } else {
+                cells.len().div_ceil(new_cols)
+            };
+            let line_rows = chunks.max(1);
+            for chunk in 0..line_rows {
+                let start = chunk * new_cols;
+                let end = (start + new_cols).min(cells.len());
+                let mut line = Vec::with_capacity(new_cols);
+                if start < cells.len() {
+                    line.extend_from_slice(&cells[start..end]);
+                }
+                line.resize(new_cols, Cell::default());
+                rows.push(line);
+                wraps.push(chunk + 1 < chunks);
+            }
+
+            if let Some(offset) = cursor_offset {
+                let (line_off, col) = if cells.is_empty() {
+                    (0, 0)
+                } else if offset >= cells.len() {
+                    let rem = offset % new_cols;
+                    (
+                        chunks.saturating_sub(1),
+                        if rem == 0 { new_cols - 1 } else { rem },
+                    )
+                } else {
+                    (offset / new_cols, offset % new_cols)
+                };
+                cursor = (line_start + line_off, col);
+            }
+        }
+
+        // Keep the viewport the same height even when reflow joins short rows.
+        while rows.len() < self.rows {
+            rows.push(vec![Cell::default(); new_cols]);
+            wraps.push(false);
+        }
+
+        // Rows that no longer fit are history, not lost content.
+        if rows.len() > self.rows {
+            let overflow = rows.len() - self.rows;
+            let removed: Vec<Vec<Cell>> = rows.drain(0..overflow).collect();
+            wraps.drain(0..overflow);
+            for line in removed {
+                self.push_scrollback(line);
+            }
+            cursor.0 = cursor.0.saturating_sub(overflow);
+        }
+
+        self.grid = rows;
+        self.grid_wrapped = wraps;
+        self.cols = new_cols;
+        self.cursor_row = cursor.0.min(self.rows - 1);
+        self.cursor_col = cursor.1.min(new_cols - 1);
     }
 
     fn push_scrollback(&mut self, mut line: Vec<Cell>) {
@@ -358,6 +489,11 @@ impl Screen {
 
     fn print(&mut self, c: char) {
         if self.cursor_col >= self.cols {
+            // Mark the row as soft-wrapped so a later column resize can join
+            // it with the row the next character lands on.
+            if let Some(wrapped) = self.grid_wrapped.get_mut(self.cursor_row) {
+                *wrapped = true;
+            }
             self.cursor_col = 0;
             self.linefeed();
         }
@@ -430,15 +566,24 @@ impl Screen {
     fn scroll_up(&mut self, n: usize) {
         for _ in 0..n.min(self.rows) {
             let line = self.grid.remove(0);
+            if !self.grid_wrapped.is_empty() {
+                self.grid_wrapped.remove(0);
+            }
             self.push_scrollback(line);
             self.grid.push(vec![Cell::default(); self.cols]);
+            self.grid_wrapped.push(false);
         }
     }
 
     fn scroll_down(&mut self, n: usize) {
         for _ in 0..n.min(self.rows) {
             self.grid.pop();
+            self.grid_wrapped.pop();
             self.grid.insert(0, vec![Cell::default(); self.cols]);
+            self.grid_wrapped.insert(0, false);
+        }
+        if let Some(last) = self.grid_wrapped.last_mut() {
+            *last = false;
         }
     }
 
@@ -479,11 +624,14 @@ impl Screen {
                 self.erase_line(0);
                 for row in self.cursor_row + 1..self.rows {
                     self.grid[row].fill(blank);
+                    self.grid_wrapped[row] = false;
                 }
+                self.grid_wrapped[self.cursor_row] = false;
             }
             1 => {
                 for row in 0..self.cursor_row {
                     self.grid[row].fill(blank);
+                    self.grid_wrapped[row] = false;
                 }
                 self.erase_line(1);
             }
@@ -491,11 +639,13 @@ impl Screen {
                 for row in &mut self.grid {
                     row.fill(blank);
                 }
+                self.grid_wrapped.fill(false);
             }
             3 => {
                 for row in &mut self.grid {
                     row.fill(blank);
                 }
+                self.grid_wrapped.fill(false);
                 if self.alt_screen.is_none() {
                     self.scrollback.clear();
                 }
@@ -520,20 +670,37 @@ impl Screen {
             2 => row.fill(blank),
             _ => {}
         }
+        if mode == 2 {
+            self.grid_wrapped[self.cursor_row] = false;
+        }
     }
 
     fn insert_lines(&mut self, n: usize) {
         for _ in 0..n.min(self.rows - self.cursor_row) {
             self.grid
                 .insert(self.cursor_row, vec![Cell::default(); self.cols]);
+            self.grid_wrapped.insert(self.cursor_row, false);
             self.grid.pop();
+            self.grid_wrapped.pop();
+        }
+        if let Some(last) = self.grid_wrapped.last_mut() {
+            *last = false;
         }
     }
 
     fn delete_lines(&mut self, n: usize) {
         for _ in 0..n.min(self.rows - self.cursor_row) {
             self.grid.remove(self.cursor_row);
+            self.grid_wrapped.remove(self.cursor_row);
             self.grid.push(vec![Cell::default(); self.cols]);
+            self.grid_wrapped.push(false);
+        }
+        // Do not accidentally join the row above with the line that moved up.
+        if self.cursor_row > 0 {
+            self.grid_wrapped[self.cursor_row - 1] = false;
+        }
+        if let Some(last) = self.grid_wrapped.last_mut() {
+            *last = false;
         }
     }
 
@@ -620,6 +787,7 @@ impl Screen {
                     for row in &mut self.grid {
                         row.fill(Cell::default());
                     }
+                    self.grid_wrapped.fill(false);
                     self.cursor_row = 0;
                     self.cursor_col = 0;
                 }
@@ -627,6 +795,7 @@ impl Screen {
             }
             let saved = SavedScreen {
                 grid: std::mem::take(&mut self.grid),
+                grid_wrapped: std::mem::take(&mut self.grid_wrapped),
                 cursor_row: self.cursor_row,
                 cursor_col: self.cursor_col,
                 saved_row: self.saved_row,
@@ -634,6 +803,7 @@ impl Screen {
                 current_style: self.current_style,
             };
             self.grid = vec![vec![Cell::default(); self.cols]; self.rows];
+            self.grid_wrapped = vec![false; self.rows];
             self.alt_screen = Some(saved);
             self.cursor_row = 0;
             self.cursor_col = 0;
@@ -648,7 +818,10 @@ impl Screen {
             for row in &mut grid {
                 row.resize(self.cols, Cell::default());
             }
+            let mut grid_wrapped = saved.grid_wrapped;
+            grid_wrapped.resize(self.rows, false);
             self.grid = grid;
+            self.grid_wrapped = grid_wrapped;
             self.cursor_row = saved.cursor_row.min(self.rows - 1);
             self.cursor_col = saved.cursor_col.min(self.cols - 1);
             self.saved_row = saved.saved_row;
@@ -663,6 +836,7 @@ impl Screen {
         for row in &mut self.grid {
             row.fill(Cell::default());
         }
+        self.grid_wrapped.fill(false);
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.saved_row = 0;
@@ -918,6 +1092,8 @@ pub struct Pty {
     alive: Arc<AtomicBool>,
     /// Set by the reader thread whenever the screen may have changed.
     dirty: Arc<AtomicBool>,
+    /// Current PTY size, so no-op resizes do not signal the child with WINCH.
+    size: Mutex<(u16, u16)>,
 }
 
 impl Pty {
@@ -1001,6 +1177,7 @@ impl Pty {
             writer,
             alive,
             dirty,
+            size: Mutex::new((cols, rows)),
         })
     }
 
@@ -1044,6 +1221,10 @@ impl Pty {
 
     /// Resizes the PTY and the local screen grid to match the current pane size.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        let mut size = self.size.lock().unwrap();
+        if *size == (cols, rows) {
+            return Ok(());
+        }
         self.master
             .resize(PtySize {
                 rows,
@@ -1056,6 +1237,7 @@ impl Pty {
             .lock()
             .unwrap()
             .resize(cols as usize, rows as usize);
+        *size = (cols, rows);
         Ok(())
     }
 }
@@ -1288,6 +1470,54 @@ mod tests {
             screen.print(c);
         }
         assert_eq!(screen.visible_lines()[0], "new");
+    }
+
+    #[test]
+    fn resizing_columns_reflows_wrapped_text() {
+        let mut screen = Screen::new(10, 4, 100);
+        for c in "abcdefghijklm".chars() {
+            screen.print(c);
+        }
+
+        screen.resize(5, 4);
+        assert_eq!(screen.visible_lines(), vec!["abcde", "fghij", "klm", ""]);
+        assert_eq!(screen.cursor(), (2, 3));
+
+        screen.resize(10, 4);
+        assert_eq!(screen.visible_lines(), vec!["abcdefghij", "klm", "", ""]);
+        assert_eq!(screen.cursor(), (1, 3));
+    }
+
+    #[test]
+    fn resizing_columns_moves_overflow_to_scrollback() {
+        let mut screen = Screen::new(10, 2, 100);
+        for c in "abcdefghijklmno".chars() {
+            screen.print(c);
+        }
+
+        screen.resize(4, 2);
+        assert_eq!(screen.visible_lines(), vec!["ijkl", "mno"]);
+        screen.set_scroll_offset(2);
+        assert_eq!(
+            screen.display_rows().map(row_string).collect::<Vec<_>>(),
+            vec!["abcd", "efgh"]
+        );
+    }
+
+    #[test]
+    fn resizing_columns_preserves_hard_line_breaks() {
+        let mut screen = Screen::new(10, 4, 100);
+        for c in "one".chars() {
+            screen.print(c);
+        }
+        screen.cursor_col = 0;
+        screen.linefeed();
+        for c in "two".chars() {
+            screen.print(c);
+        }
+
+        screen.resize(2, 4);
+        assert_eq!(screen.visible_lines(), vec!["on", "e", "tw", "o"]);
     }
 
     #[test]
