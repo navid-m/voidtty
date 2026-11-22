@@ -12,12 +12,13 @@ use glfw::{Context as _, GlfwReceiver, OpenGlProfileHint, WindowEvent, WindowHin
 use std::{
     env,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use app::{App, SplitDir};
 use config::Config;
 use renderer::Renderer;
-use terminal::{Cell, Color, MouseMode, Style};
+use terminal::{Cell, Color, CursorShape, MouseMode, Style};
 use ui::{Rect, UiMetrics, layout_rects, pane_content, text_cols, text_rows};
 
 const FALLBACK_FONT: &[u8] = include_bytes!("../assets/font.ttf");
@@ -98,6 +99,8 @@ fn main() -> Result<()> {
     // Size the PTY grids to the actual panes before the first frame.
     resize_ptys(&mut app, &renderer, ui);
 
+    let blink_epoch = Instant::now();
+    let mut last_blink_phase = true;
     let mut redraw = true;
     let mut was_iconified = window.is_iconified();
     while !window.should_close() && app.running {
@@ -154,8 +157,21 @@ fn main() -> Result<()> {
         }
 
         redraw = events_changed || output_changed || layout_changed || restored;
+
+        let blink_on = (blink_epoch.elapsed().as_millis() / 500).is_multiple_of(2);
+        if blink_on != last_blink_phase {
+            last_blink_phase = blink_on;
+            if app.active_needs_blink_animation() {
+                redraw = true;
+            }
+        }
+
+        // DECSET 2026 asks the terminal to present the screen atomically.
+        if redraw && app.active_synchronized_output() {
+            redraw = false;
+        }
         if redraw {
-            draw_frame(&mut renderer, &app, ui)?;
+            draw_frame(&mut renderer, &app, ui, blink_on)?;
             window.swap_buffers();
         }
     }
@@ -195,7 +211,11 @@ fn process_events(
                 }
             }
             WindowEvent::Char(c) => {
-                input::handle_char(c, app)?;
+                if app.search.is_some() {
+                    app.search_input(c);
+                } else {
+                    input::handle_char(c, app)?;
+                }
                 redraw = true;
             }
             WindowEvent::Scroll(_, y) => {
@@ -536,6 +556,9 @@ fn process_events(
             }
         }
     }
+    if let Some(search) = app.search.as_mut() {
+        search.ignore_next_char = false;
+    }
     Ok(redraw)
 }
 
@@ -638,6 +661,18 @@ fn link_in_pane(
         return None;
     }
     let (row, col) = cell_at(pane, rect, ui, cell_w, line_h, mx, my)?;
+    if let Some((url, start_col, end_col)) = {
+        let screen = pane.active().pty.screen.lock().unwrap();
+        screen.link_at(row, col)
+    } {
+        return Some(app::HoverLink {
+            pane: pane.id,
+            row,
+            start_col,
+            end_col,
+            target: app::LinkTarget::Url(url),
+        });
+    }
     let chars: Vec<char> = {
         let screen = pane.active().pty.screen.lock().unwrap();
         screen.display_row(row).iter().map(|cell| cell.ch).collect()
@@ -933,6 +968,9 @@ fn cell_colors(style: Style) -> ((f32, f32, f32), (f32, f32, f32), bool) {
     if style.bold && style.fg == Color::Default {
         fg = (1.0, 1.0, 1.0);
     }
+    if style.dim {
+        fg = (fg.0 * 0.55, fg.1 * 0.55, fg.2 * 0.55);
+    }
     if style.reverse {
         std::mem::swap(&mut fg, &mut bg);
     }
@@ -982,7 +1020,126 @@ fn scrollbar_offset_at(geom: &ScrollbarGeom, max_scroll: usize, y: f32) -> usize
     ((1.0 - frac) * max_scroll as f32).round() as usize
 }
 
-fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
+fn draw_plain_line(
+    renderer: &mut Renderer,
+    text: &str,
+    x: f32,
+    y: f32,
+    max_chars: usize,
+    color: (f32, f32, f32),
+    alpha: f32,
+) -> Result<()> {
+    let line: String = text.chars().take(max_chars).collect();
+    let colors = vec![color; line.chars().count()];
+    renderer.draw_text_styled(&line, &colors, None, None, x, y, alpha)
+}
+
+fn draw_search(renderer: &mut Renderer, app: &App, ui: UiMetrics, opacity: f32) -> Result<()> {
+    let Some(search) = app.search.as_ref() else {
+        return Ok(());
+    };
+    // Flush the panes first so the overlay is painted strictly on top.
+    renderer.flush();
+    let cw = renderer.cell_w();
+    let lh = renderer.line_height();
+    let win_w = renderer.win_w;
+    let win_h = renderer.win_h;
+    let pad = 14.0 * ui.scale;
+    let panel_w = (win_w * 0.7).clamp(320.0, 900.0).min(win_w - 16.0);
+    let max_chars = ((panel_w - pad * 2.0) / cw).floor().max(1.0) as usize;
+    let max_results = (((win_h * 0.7) / lh).floor() as usize).max(4) - 3;
+    let visible = search.hits.len().min(max_results);
+    let rows = 3 + visible.max(1);
+    let panel_h = (rows as f32 * lh + pad * 2.0).min(win_h - 16.0);
+    let x = (win_w - panel_w) * 0.5;
+    let y = (win_h - panel_h) * 0.5;
+    let tx = x + pad;
+    let mut ty = y + pad;
+
+    renderer.draw_rect(0.0, 0.0, win_w, win_h, 0.0, 0.0, 0.0, 0.55 * opacity);
+    renderer.draw_round_rect(
+        x,
+        y,
+        panel_w,
+        panel_h,
+        8.0 * ui.scale,
+        0.08,
+        0.09,
+        0.13,
+        0.98 * opacity,
+    );
+
+    let header = format!("History  ·  {} result(s)", search.hits.len());
+    draw_plain_line(
+        renderer,
+        &header,
+        tx,
+        ty,
+        max_chars,
+        (0.55, 0.68, 0.90),
+        opacity,
+    )?;
+    ty += lh;
+    draw_plain_line(
+        renderer,
+        &format!("> {}", search.query),
+        tx,
+        ty,
+        max_chars,
+        (0.95, 0.96, 1.0),
+        opacity,
+    )?;
+    ty += lh * 1.2;
+
+    if search.hits.is_empty() {
+        let message = if search.query.is_empty() {
+            "Type to search scrollback across all panes"
+        } else {
+            "No matches"
+        };
+        draw_plain_line(
+            renderer,
+            message,
+            tx,
+            ty,
+            max_chars,
+            (0.55, 0.55, 0.60),
+            opacity,
+        )?;
+    } else {
+        let start = search
+            .selected
+            .saturating_sub(visible / 2)
+            .min(search.hits.len().saturating_sub(visible));
+        for (offset, hit) in search.hits.iter().skip(start).take(visible).enumerate() {
+            let index = start + offset;
+            if index == search.selected {
+                renderer.draw_rect(
+                    tx - pad * 0.4,
+                    ty,
+                    panel_w - pad * 1.2,
+                    lh,
+                    0.20,
+                    0.34,
+                    0.58,
+                    opacity,
+                );
+            }
+            let label = format!("[{}] {}", hit.pane, hit.text);
+            let color = if index == search.selected {
+                (0.95, 0.96, 1.0)
+            } else {
+                (0.72, 0.74, 0.80)
+            };
+            draw_plain_line(renderer, &label, tx, ty, max_chars, color, opacity)?;
+            ty += lh;
+        }
+    }
+
+    Ok(())
+}
+
+fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics, blink_on: bool) -> Result<()> {
     let opacity = app.config.opacity;
     // Black background respecting transparency.
     renderer.clear(0.0, 0.0, 0.0, opacity);
@@ -1005,8 +1162,11 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
             &mut rows,
             selection,
             hover,
+            blink_on,
         )?;
     }
+
+    draw_search(renderer, app, ui, opacity)?;
 
     renderer.flush();
     Ok(())
@@ -1023,6 +1183,7 @@ fn draw_pane(
     rows: &mut Vec<Vec<Cell>>,
     selection: Option<app::Selection>,
     hover: Option<&app::HoverLink>,
+    blink_on: bool,
 ) -> Result<()> {
     // Pane background.
     renderer.draw_rect(rect.x, rect.y, rect.w, rect.h, 0.0, 0.0, 0.0, opacity);
@@ -1049,12 +1210,20 @@ fn draw_pane(
     let content = pane_content(rect, ui.tab_bar_h);
     // Copy the visible grid out while briefly holding the lock; the PTY reader
     // thread stays unblocked while text is shaped and uploaded.
-    let ((cursor_row, cursor_col), cursor_visible, scroll_offset, max_scroll, row_count) = {
+    let (
+        (cursor_row, cursor_col),
+        cursor_visible,
+        cursor_style,
+        scroll_offset,
+        max_scroll,
+        row_count,
+    ) = {
         let screen = pane.active().pty.screen.lock().unwrap();
         screen.copy_visible(rows);
         (
             screen.cursor(),
             screen.cursor_visible(),
+            screen.cursor_style(),
             screen.scroll_offset(),
             screen.max_scroll(),
             screen.rows(),
@@ -1062,19 +1231,23 @@ fn draw_pane(
     };
     let cw = renderer.cell_w();
     let lh = renderer.line_height();
-    let show_cursor = focused && scroll_offset == 0 && cursor_visible;
+    let cursor_phase_on = !cursor_style.blink || blink_on;
+    let show_cursor = focused && scroll_offset == 0 && cursor_visible && cursor_phase_on;
 
     let mut text = String::new();
     let mut row_colors: Vec<(f32, f32, f32)> = Vec::new();
+    let mut row_cells: Vec<usize> = Vec::new();
+    let mut row_italic: Vec<bool> = Vec::new();
 
     for (row, cells) in rows.iter().enumerate() {
         let y = content.y + ui.pane_pad + row as f32 * lh;
         let cursor_here = show_cursor && row == cursor_row;
-        let cursor_cell = cursor_here.then(|| cursor_col.min(cells.len().saturating_sub(1)));
+        let cursor_cell = (cursor_here && cursor_style.shape == CursorShape::Block)
+            .then(|| cursor_col.min(cells.len().saturating_sub(1)));
 
         let mut last = cells
             .iter()
-            .rposition(|c| c.ch != ' ' || c.style != Style::default())
+            .rposition(|cell| !cell.is_blank())
             .map(|i| i + 1)
             .unwrap_or(0);
         if let Some(col) = cursor_cell {
@@ -1098,6 +1271,10 @@ fn draw_pane(
         text.clear();
         row_colors.clear();
         row_colors.reserve(last);
+        row_cells.clear();
+        row_cells.reserve(last);
+        row_italic.clear();
+        row_italic.reserve(last);
         // Merge neighbouring cells that share a background into one rectangle.
         let mut run_start: Option<usize> = None;
         let mut run_color = (0.0f32, 0.0f32, 0.0f32);
@@ -1112,13 +1289,11 @@ fn draw_pane(
 
         for (col, cell) in cells[..last].iter().enumerate() {
             let style = if Some(col) == cursor_cell {
-                // Solid, non-blinking block cursor.
                 Style {
                     fg: Color::Default,
                     bg: Color::Default,
-                    bold: false,
-                    underline: false,
                     reverse: true,
+                    ..Style::default()
                 }
             } else {
                 cell.style
@@ -1142,39 +1317,103 @@ fn draw_pane(
                 run_start = None;
             }
             let x = content.x + ui.pane_pad + col as f32 * cw;
+            let blink_off = style.blink && !blink_on && !selected;
             let hovered = hover.is_some_and(|hover| {
                 hover.row == row && col >= hover.start_col && col <= hover.end_col
             });
-            if hovered {
-                let thickness = (1.5 * ui.scale).max(1.0);
-                renderer.draw_rect(
-                    x,
-                    y + lh - thickness,
-                    cw,
-                    thickness,
-                    0.45,
-                    0.75,
-                    1.0,
-                    opacity,
-                );
-            } else if style.underline {
-                renderer.draw_rect(x, y + lh - 1.5, cw, 1.0, fg.0, fg.1, fg.2, opacity);
+            if !blink_off {
+                if hovered {
+                    let thickness = (1.5 * ui.scale).max(1.0);
+                    renderer.draw_rect(
+                        x,
+                        y + lh - thickness,
+                        cw,
+                        thickness,
+                        0.45,
+                        0.75,
+                        1.0,
+                        opacity,
+                    );
+                } else {
+                    if style.underline {
+                        let thickness = (1.5 * ui.scale).max(1.0);
+                        renderer.draw_rect(
+                            x,
+                            y + lh - thickness,
+                            cw,
+                            thickness,
+                            fg.0,
+                            fg.1,
+                            fg.2,
+                            opacity,
+                        );
+                    }
+                    if style.strikethrough {
+                        let thickness = ui.scale.max(1.0);
+                        renderer.draw_rect(
+                            x,
+                            y + (lh - thickness) * 0.5,
+                            cw,
+                            thickness,
+                            fg.0,
+                            fg.1,
+                            fg.2,
+                            opacity,
+                        );
+                    }
+                }
             }
-            if crate::renderer::is_block_element(cell.ch) {
+            if blink_off || cell.wide {
+                // Keep one character per cell so shaping stays column-aligned.
+                text.push(' ');
+                row_cells.push(col);
+            } else if crate::renderer::is_block_element(cell.ch) {
                 // End the background run so the block paints over its own cell.
                 flush_run(renderer, run_start, col, run_color);
                 run_start = None;
                 renderer.draw_block_element(cell.ch, x, y, fg, opacity);
                 // Keep the cell in the row so shaping still aligns to columns.
                 text.push(' ');
+                row_cells.push(col);
             } else {
                 text.push(cell.ch);
+                row_cells.push(col);
+                if let Some(mark) = cell.combining {
+                    text.push(mark);
+                    row_cells.push(col);
+                }
             }
             row_colors.push(fg);
+            row_italic.push(style.italic && !blink_off);
         }
         flush_run(renderer, run_start, last, run_color);
 
-        renderer.draw_text_styled(&text, &row_colors, content.x + ui.pane_pad, y, 1.0)?;
+        renderer.draw_text_styled(
+            &text,
+            &row_colors,
+            Some(&row_cells),
+            Some(&row_italic),
+            content.x + ui.pane_pad,
+            y,
+            1.0,
+        )?;
+    }
+
+    if show_cursor && cursor_style.shape != CursorShape::Block {
+        let x = content.x + ui.pane_pad + cursor_col as f32 * cw;
+        let y = content.y + ui.pane_pad + cursor_row as f32 * lh;
+        let (r, g, b) = DEFAULT_FG;
+        match cursor_style.shape {
+            CursorShape::Bar => {
+                let w = (cw * 0.15).max(2.0 * ui.scale);
+                renderer.draw_rect(x, y, w, lh, r, g, b, opacity);
+            }
+            CursorShape::Underline => {
+                let h = (lh * 0.1).max(2.0 * ui.scale);
+                renderer.draw_rect(x, y + lh - h, cw, h, r, g, b, opacity);
+            }
+            CursorShape::Block => {}
+        }
     }
 
     // Vertical scrollbar, drawn inside the pane's right padding.
@@ -1277,6 +1516,8 @@ fn draw_tab_bar(
         renderer.draw_text_styled(
             &label,
             &colors,
+            None,
+            None,
             tab_x,
             tab_text_y,
             if active { 1.0 } else { 0.85 },

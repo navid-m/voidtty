@@ -270,6 +270,26 @@ pub struct HoverLink {
     pub target: LinkTarget,
 }
 
+/// One cross-pane history search result.
+#[derive(Clone, Debug)]
+pub struct SearchHit {
+    pub pane: usize,
+    pub tab: usize,
+    pub line: usize,
+    pub text: String,
+}
+
+/// State of the Ctrl+Shift+/ history search overlay.
+#[derive(Debug, Default)]
+pub struct SearchState {
+    pub query: String,
+    pub hits: Vec<SearchHit>,
+    pub selected: usize,
+    pub ignore_next_char: bool,
+}
+
+const SEARCH_RESULT_LIMIT: usize = 100;
+
 /// Details of the last mouse press, used to detect double-clicks.
 struct LastClick {
     pane: usize,
@@ -317,6 +337,8 @@ pub struct App {
     pub ctrl_down: bool,
     /// Path or URL under the pointer while Ctrl is held.
     pub hover_link: Option<HoverLink>,
+    /// Cross-pane history search overlay, when open.
+    pub search: Option<SearchState>,
     last_click: Option<LastClick>,
     next_pane_id: usize,
     next_accent: usize,
@@ -338,6 +360,7 @@ impl App {
             mouse_pressed: None,
             ctrl_down: false,
             hover_link: None,
+            search: None,
             last_click: None,
             next_pane_id: 0,
             next_accent: 0,
@@ -550,6 +573,128 @@ impl App {
         };
         let len = order.len() as isize;
         self.focused = order[(index as isize + step).rem_euclid(len) as usize];
+    }
+
+    pub fn active_needs_blink_animation(&self) -> bool {
+        self.panes.iter().any(|pane| {
+            pane.active()
+                .pty
+                .screen
+                .lock()
+                .unwrap()
+                .needs_blink_animation()
+        })
+    }
+
+    pub fn active_synchronized_output(&self) -> bool {
+        self.panes
+            .iter()
+            .any(|pane| pane.active().pty.is_synchronized())
+    }
+
+    pub fn open_search(&mut self) {
+        self.search = Some(SearchState {
+            ignore_next_char: true,
+            ..SearchState::default()
+        });
+        self.selection = None;
+    }
+
+    pub fn close_search(&mut self) {
+        self.search = None;
+    }
+
+    pub fn search_input(&mut self, c: char) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        if search.ignore_next_char {
+            search.ignore_next_char = false;
+            return;
+        }
+        if !c.is_control() {
+            search.query.push(c);
+            self.refresh_search();
+        }
+    }
+
+    pub fn search_backspace(&mut self) {
+        if let Some(search) = self.search.as_mut() {
+            search.query.pop();
+        }
+        self.refresh_search();
+    }
+
+    pub fn search_move(&mut self, step: isize) {
+        if let Some(search) = self.search.as_mut()
+            && !search.hits.is_empty()
+        {
+            let len = search.hits.len() as isize;
+            search.selected = (search.selected as isize + step).rem_euclid(len) as usize;
+        }
+    }
+
+    pub fn refresh_search(&mut self) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        let query = search.query.clone();
+        let mut hits = Vec::new();
+        if !query.is_empty() {
+            'panes: for pane in &self.panes {
+                for (tab_index, tab) in pane.tabs.iter().enumerate() {
+                    let mut lines = Vec::new();
+                    tab.pty.screen.lock().unwrap().search_history(
+                        &query,
+                        SEARCH_RESULT_LIMIT - hits.len(),
+                        &mut lines,
+                    );
+                    for (line, text) in lines {
+                        hits.push(SearchHit {
+                            pane: pane.id,
+                            tab: tab_index,
+                            line,
+                            text,
+                        });
+                        if hits.len() >= SEARCH_RESULT_LIMIT {
+                            break 'panes;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(search) = self.search.as_mut() {
+            search.hits = hits;
+            search.selected = search.selected.min(search.hits.len().saturating_sub(1));
+        }
+    }
+
+    /// Focuses and scrolls to the selected search result.
+    pub fn activate_search_hit(&mut self) {
+        let hit = {
+            let Some(search) = self.search.as_ref() else {
+                return;
+            };
+            search.hits.get(search.selected).cloned()
+        };
+        let Some(hit) = hit else {
+            self.search = None;
+            return;
+        };
+        self.focused = hit.pane;
+        if let Some(pane) = self.pane_mut(hit.pane)
+            && hit.tab < pane.tabs.len()
+        {
+            pane.active_tab = hit.tab;
+        }
+        if let Some(pane) = self.pane(hit.pane) {
+            let mut screen = pane.active().pty.screen.lock().unwrap();
+            let scrollback = screen.history_line_count().saturating_sub(screen.rows());
+            screen.set_scroll_offset(scrollback.saturating_sub(hit.line));
+        }
+        self.search = None;
+        self.selection = None;
+        self.hover_link = None;
     }
 
     /// Returns the text covered by the current selection, if any.

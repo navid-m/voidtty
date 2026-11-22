@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
+    collections::HashMap,
     io::{ErrorKind, Read, Write},
     sync::{
         Arc, Mutex,
@@ -8,6 +9,7 @@ use std::{
     },
     thread,
 };
+use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
 
 /// A terminal color: the default foreground/background, an ANSI 256-color
@@ -26,7 +28,11 @@ pub struct Style {
     pub fg: Color,
     pub bg: Color,
     pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
     pub underline: bool,
+    pub blink: bool,
+    pub strikethrough: bool,
     pub reverse: bool,
 }
 
@@ -35,6 +41,12 @@ pub struct Style {
 pub struct Cell {
     pub ch: char,
     pub style: Style,
+    /// A combining mark rendered with `ch`.
+    pub combining: Option<char>,
+    /// True for the right half of a double-width character.
+    pub wide: bool,
+    /// Index into `Screen::links`, or 0 for no OSC 8 hyperlink.
+    pub link: u32,
 }
 
 impl Default for Cell {
@@ -42,11 +54,24 @@ impl Default for Cell {
         Self {
             ch: ' ',
             style: Style::default(),
+            combining: None,
+            wide: false,
+            link: 0,
         }
     }
 }
 
 impl Cell {
+    fn plain(ch: char, style: Style, link: u32) -> Self {
+        Self {
+            ch,
+            style,
+            combining: None,
+            wide: false,
+            link,
+        }
+    }
+
     /// A blank cell that keeps only the current background (BCE), so clearing a
     /// line does not leave every erased space tagged with a foreground color.
     fn blank(style: Style) -> Self {
@@ -62,16 +87,58 @@ impl Cell {
                 bg,
                 ..Style::default()
             },
+            combining: None,
+            wide: false,
+            link: 0,
+        }
+    }
+
+    pub fn is_blank(&self) -> bool {
+        self.ch == ' '
+            && !self.wide
+            && self.combining.is_none()
+            && self.style == Style::default()
+            && self.link == 0
+    }
+
+    /// Appends this cell's visible text. The right half of a wide character
+    /// contributes no character of its own.
+    pub fn push_text(&self, out: &mut String) {
+        if self.wide {
+            return;
+        }
+        out.push(self.ch);
+        if let Some(mark) = self.combining {
+            out.push(mark);
         }
     }
 }
 
 #[cfg(test)]
 fn row_string(row: &[Cell]) -> String {
-    let mut s: String = row.iter().map(|cell| cell.ch).collect();
+    let mut s = String::new();
+    for cell in row {
+        cell.push_text(&mut s);
+    }
     let trimmed = s.trim_end().len();
     s.truncate(trimmed);
     s
+}
+
+/// DECSCUSR cursor shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Bar,
+}
+
+/// Cursor shape and blink requested by DECSCUSR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CursorStyle {
+    pub shape: CursorShape,
+    pub blink: bool,
 }
 
 /// Mouse reporting modes requested by the running program via DECSET.
@@ -138,6 +205,14 @@ pub struct Screen {
     /// DECSET 1006 SGR mouse coordinate encoding.
     mouse_sgr: bool,
     title: String,
+    /// OSC 8 hyperlink URIs; index 0 is reserved for "no link".
+    links: Vec<String>,
+    link_ids: HashMap<String, u32>,
+    current_link: u32,
+    /// DECSCUSR cursor shape.
+    cursor_style: CursorStyle,
+    /// True once a blinking cell has been printed.
+    blink_active: bool,
 }
 
 impl Screen {
@@ -164,6 +239,11 @@ impl Screen {
             mouse_mode: MouseMode::Off,
             mouse_sgr: false,
             title: "Terminal".to_owned(),
+            links: vec![String::new()],
+            link_ids: HashMap::new(),
+            current_link: 0,
+            cursor_style: CursorStyle::default(),
+            blink_active: false,
         }
     }
 
@@ -204,6 +284,52 @@ impl Screen {
     /// Whether the program running in the pane wants the cursor shown.
     pub fn cursor_visible(&self) -> bool {
         self.cursor_visible
+    }
+
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.cursor_style
+    }
+
+    /// Whether the cursor or a visible cell needs periodic repainting.
+    pub fn needs_blink_animation(&mut self) -> bool {
+        if self.cursor_visible && self.cursor_style.blink {
+            return true;
+        }
+        if self.blink_active {
+            let visible = self
+                .display_rows()
+                .any(|row| row.iter().any(|cell| cell.style.blink));
+            self.blink_active = visible;
+        }
+        self.blink_active
+    }
+
+    /// Resolves an OSC 8 hyperlink id to its URI.
+    pub fn link_uri(&self, link: u32) -> Option<&str> {
+        if link == 0 {
+            return None;
+        }
+        self.links.get(link as usize).map(String::as_str)
+    }
+
+    /// Returns the explicit OSC 8 link covering a display cell, and the range
+    /// of cells sharing that link.
+    pub fn link_at(&self, row: usize, col: usize) -> Option<(String, usize, usize)> {
+        let cells = self.display_row(row);
+        let link = cells.get(col)?.link;
+        if link == 0 {
+            return None;
+        }
+        let start = (0..col)
+            .rev()
+            .take_while(|&c| cells[c].link == link)
+            .last()
+            .unwrap_or(col);
+        let end = (col + 1..cells.len())
+            .take_while(|&c| cells[c].link == link)
+            .last()
+            .unwrap_or(col);
+        Some((self.link_uri(link)?.to_owned(), start, end))
     }
 
     /// Maximum scroll offset (top of history).
@@ -247,13 +373,15 @@ impl Screen {
 
     /// Returns a row as currently displayed (history when scrolled up).
     pub fn display_row(&self, row: usize) -> &[Cell] {
-        let offset = self.scroll_offset();
-        let history_rows = offset.min(self.rows);
-        let cells = if row < history_rows {
-            let index = self.scrollback.len() - history_rows + row;
+        let total = self.scrollback.len() + self.rows;
+        let top = total
+            .saturating_sub(self.rows + self.scroll_offset())
+            .min(self.scrollback.len());
+        let index = top + row;
+        let cells = if index < self.scrollback.len() {
             &self.scrollback[index][..]
         } else {
-            &self.grid[row - history_rows][..]
+            &self.grid[(index - self.scrollback.len()).min(self.rows - 1)][..]
         };
         &cells[..cells.len().min(self.cols)]
     }
@@ -261,6 +389,62 @@ impl Screen {
     /// Iterates over the rows currently visible in the viewport.
     pub fn display_rows(&self) -> impl Iterator<Item = &[Cell]> {
         (0..self.rows).map(move |row| self.display_row(row))
+    }
+
+    pub fn history_line_count(&self) -> usize {
+        self.scrollback.len() + self.rows
+    }
+
+    /// Returns one line of scrollback or the live grid as plain text.
+    pub fn history_line(&self, index: usize) -> String {
+        let cells = if index < self.scrollback.len() {
+            &self.scrollback[index][..]
+        } else if index - self.scrollback.len() < self.grid.len() {
+            &self.grid[index - self.scrollback.len()][..]
+        } else {
+            return String::new();
+        };
+        let mut text = String::new();
+        for cell in cells {
+            cell.push_text(&mut text);
+        }
+        text.trim_end().to_owned()
+    }
+
+    /// Searches scrollback and the live grid, newest lines first, appending
+    /// `(line index, snippet)` pairs to `out`.
+    pub fn search_history(&self, needle: &str, max_results: usize, out: &mut Vec<(usize, String)>) {
+        if needle.is_empty() || max_results == 0 {
+            return;
+        }
+        let needle_lower = needle.to_lowercase();
+        let start = out.len();
+        for index in (0..self.history_line_count()).rev() {
+            let line = self.history_line(index);
+            if line.is_empty() {
+                continue;
+            }
+            let (pos, folded) = match line.find(needle) {
+                Some(pos) => (pos, None),
+                None => {
+                    let folded = line.to_lowercase();
+                    match folded.find(&needle_lower) {
+                        Some(pos) => (pos, Some(folded)),
+                        None => continue,
+                    }
+                }
+            };
+            let hit_char = folded.as_deref().unwrap_or(&line)[..pos].chars().count();
+            let skip = hit_char.saturating_sub(40);
+            let mut snippet: String = line.chars().skip(skip).take(180).collect();
+            if skip > 0 {
+                snippet.insert(0, '…');
+            }
+            out.push((index, snippet));
+            if out.len() - start >= max_results {
+                return;
+            }
+        }
     }
 
     /// Copies the displayed rows into `out` so the renderer can work without
@@ -302,7 +486,10 @@ impl Screen {
                 lines.push(String::new());
                 continue;
             }
-            let line: String = cells[first..=last].iter().map(|cell| cell.ch).collect();
+            let mut line = String::new();
+            for cell in &cells[first..=last] {
+                cell.push_text(&mut line);
+            }
             lines.push(line.trim_end().to_owned());
         }
         lines.join("\n")
@@ -365,9 +552,7 @@ impl Screen {
         // lines; keeping them would make reflow push real content off the top.
         let mut end = old_grid.len();
         while end > 0 {
-            let blank = old_grid[end - 1]
-                .iter()
-                .all(|c| c.ch == ' ' && c.style == Style::default());
+            let blank = old_grid[end - 1].iter().all(Cell::is_blank);
             if !blank {
                 break;
             }
@@ -405,35 +590,46 @@ impl Screen {
                 }
             }
 
-            let chunks = if cells.is_empty() {
-                0
-            } else {
-                cells.len().div_ceil(new_cols)
-            };
-            let line_rows = chunks.max(1);
-            for chunk in 0..line_rows {
-                let start = chunk * new_cols;
-                let end = (start + new_cols).min(cells.len());
-                let mut line = Vec::with_capacity(new_cols);
-                if start < cells.len() {
-                    line.extend_from_slice(&cells[start..end]);
+            let mut cursor_pos = None;
+            let mut pos = 0;
+            let mut last_pos = 0;
+            while pos < cells.len() {
+                last_pos = pos;
+                let mut end = (pos + new_cols).min(cells.len());
+                // Keep a double-width character and its continuation together.
+                if end < cells.len() && cells[end].wide {
+                    end -= 1;
                 }
+                if end == pos {
+                    end = (pos + new_cols).min(cells.len());
+                }
+                let mut line = Vec::with_capacity(new_cols);
+                line.extend_from_slice(&cells[pos..end]);
                 line.resize(new_cols, Cell::default());
                 rows.push(line);
-                wraps.push(chunk + 1 < chunks);
+                wraps.push(end < cells.len());
+                if let Some(offset) = cursor_offset
+                    && offset >= pos
+                    && offset < end
+                {
+                    cursor_pos = Some((rows.len() - 1 - line_start, offset - pos));
+                }
+                pos = end;
+            }
+
+            if cells.is_empty() {
+                rows.push(vec![Cell::default(); new_cols]);
+                wraps.push(false);
             }
 
             if let Some(offset) = cursor_offset {
-                let (line_off, col) = if cells.is_empty() {
-                    (0, 0)
-                } else if offset >= cells.len() {
-                    let rem = offset % new_cols;
-                    (
-                        chunks.saturating_sub(1),
-                        if rem == 0 { new_cols - 1 } else { rem },
-                    )
-                } else {
-                    (offset / new_cols, offset % new_cols)
+                let (line_off, col) = match cursor_pos {
+                    Some(pos) => pos,
+                    None if cells.is_empty() => (0, 0),
+                    None => (
+                        rows.len().saturating_sub(1).max(line_start) - line_start,
+                        (offset - last_pos).min(new_cols - 1),
+                    ),
                 };
                 cursor = (line_start + line_off, col);
             }
@@ -469,10 +665,7 @@ impl Screen {
         if self.alt_screen.is_some() || self.scrollback_limit == 0 {
             return;
         }
-        while line
-            .last()
-            .is_some_and(|c| c.ch == ' ' && c.style == Style::default())
-        {
+        while line.last().is_some_and(Cell::is_blank) {
             line.pop();
         }
         self.scrollback.push(line);
@@ -488,6 +681,49 @@ impl Screen {
     }
 
     fn print(&mut self, c: char) {
+        let mut width = c.width().unwrap_or(1);
+        if self.cols < 2 {
+            width = 1;
+        }
+        if width == 0 {
+            let (row, mut col) = if self.cursor_col > 0 {
+                (self.cursor_row, self.cursor_col - 1)
+            } else if self.cursor_row > 0 {
+                (self.cursor_row - 1, self.cols - 1)
+            } else {
+                return;
+            };
+            if self.grid[row][col].wide && col > 0 {
+                col -= 1;
+            }
+            // VS16 requests emoji presentation, which occupies two cells even
+            // when the base character is narrow on its own.
+            if c == '\u{FE0F}'
+                && !self.grid[row][col].wide
+                && col + 1 < self.cols
+                && self.grid[row][col + 1].ch == ' '
+                && !self.grid[row][col + 1].wide
+                && self.grid[row][col + 1].combining.is_none()
+            {
+                let style = self.grid[row][col].style;
+                let link = self.grid[row][col].link;
+                self.grid[row][col + 1] = Cell {
+                    ch: ' ',
+                    style,
+                    combining: None,
+                    wide: true,
+                    link,
+                };
+                if self.cursor_row == row && self.cursor_col == col + 1 {
+                    self.cursor_col = (col + 2).min(self.cols);
+                }
+            }
+            if self.grid[row][col].combining.is_none() {
+                self.grid[row][col].combining = Some(c);
+            }
+            return;
+        }
+
         if self.cursor_col >= self.cols {
             // Mark the row as soft-wrapped so a later column resize can join
             // it with the row the next character lands on.
@@ -497,11 +733,39 @@ impl Screen {
             self.cursor_col = 0;
             self.linefeed();
         }
-        self.grid[self.cursor_row][self.cursor_col] = Cell {
-            ch: c,
-            style: self.current_style,
-        };
-        self.cursor_col += 1;
+
+        // A double-width character cannot straddle the right margin.
+        if width == 2 && self.cursor_col + 1 >= self.cols {
+            if let Some(wrapped) = self.grid_wrapped.get_mut(self.cursor_row) {
+                *wrapped = true;
+            }
+            self.cursor_col = 0;
+            self.linefeed();
+        }
+
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        if self.grid[row][col].wide && col > 0 {
+            self.grid[row][col - 1] = Cell::blank(self.current_style);
+        }
+        if col + 1 < self.cols && self.grid[row][col + 1].wide {
+            self.grid[row][col + 1] = Cell::blank(self.current_style);
+        }
+
+        self.grid[row][col] = Cell::plain(c, self.current_style, self.current_link);
+        if width == 2 {
+            self.grid[row][col + 1] = Cell {
+                ch: ' ',
+                style: self.current_style,
+                combining: None,
+                wide: true,
+                link: self.current_link,
+            };
+        }
+        if self.current_style.blink {
+            self.blink_active = true;
+        }
+        self.cursor_col += width;
     }
 
     fn apply_sgr(&mut self, params: &Params) {
@@ -520,11 +784,21 @@ impl Screen {
             match code {
                 0 => self.current_style = Style::default(),
                 1 => self.current_style.bold = true,
-                4 => self.current_style.underline = true,
+                2 => self.current_style.dim = true,
+                3 => self.current_style.italic = true,
+                4 | 21 => self.current_style.underline = true,
+                5 | 6 => self.current_style.blink = true,
                 7 => self.current_style.reverse = true,
-                22 => self.current_style.bold = false,
+                9 => self.current_style.strikethrough = true,
+                22 => {
+                    self.current_style.bold = false;
+                    self.current_style.dim = false;
+                }
+                23 => self.current_style.italic = false,
                 24 => self.current_style.underline = false,
+                25 => self.current_style.blink = false,
                 27 => self.current_style.reverse = false,
+                29 => self.current_style.strikethrough = false,
                 30..=37 => self.current_style.fg = Color::Indexed((code - 30) as u8),
                 39 => self.current_style.fg = Color::Default,
                 40..=47 => self.current_style.bg = Color::Indexed((code - 40) as u8),
@@ -640,6 +914,7 @@ impl Screen {
                     row.fill(blank);
                 }
                 self.grid_wrapped.fill(false);
+                self.blink_active = false;
             }
             3 => {
                 for row in &mut self.grid {
@@ -650,6 +925,7 @@ impl Screen {
                     self.scrollback.clear();
                 }
                 self.scroll_offset = 0;
+                self.blink_active = false;
             }
             _ => {}
         }
@@ -733,6 +1009,30 @@ impl Screen {
         self.cursor_visible = visible;
     }
 
+    fn set_cursor_style(&mut self, style: CursorStyle) {
+        self.cursor_style = style;
+    }
+
+    fn set_hyperlink(&mut self, uri: Option<&str>) {
+        let Some(uri) = uri.filter(|uri| !uri.is_empty()) else {
+            self.current_link = 0;
+            return;
+        };
+        if let Some(&id) = self.link_ids.get(uri) {
+            self.current_link = id;
+            return;
+        }
+        // Bound the table so a runaway program cannot grow it forever.
+        if self.links.len() >= 4096 {
+            self.current_link = 0;
+            return;
+        }
+        let id = self.links.len() as u32;
+        self.links.push(uri.to_owned());
+        self.link_ids.insert(uri.to_owned(), id);
+        self.current_link = id;
+    }
+
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
     }
@@ -812,6 +1112,7 @@ impl Screen {
             self.scroll_offset = 0;
             self.scroll_pending = 0.0;
             self.current_style = Style::default();
+            self.current_link = 0;
         } else if let Some(saved) = self.alt_screen.take() {
             let mut grid = saved.grid;
             grid.resize_with(self.rows, || vec![Cell::default(); self.cols]);
@@ -827,6 +1128,7 @@ impl Screen {
             self.saved_row = saved.saved_row;
             self.saved_col = saved.saved_col;
             self.current_style = saved.current_style;
+            self.current_link = 0;
             self.scroll_offset = 0;
             self.scroll_pending = 0.0;
         }
@@ -850,6 +1152,9 @@ impl Screen {
         self.bracketed_paste = false;
         self.mouse_mode = MouseMode::Off;
         self.mouse_sgr = false;
+        self.current_link = 0;
+        self.cursor_style = CursorStyle::default();
+        self.blink_active = false;
     }
 }
 
@@ -896,6 +1201,7 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 struct Performer {
     screen: Arc<Mutex<Screen>>,
     writer: SharedWriter,
+    sync_output: Arc<AtomicBool>,
 }
 
 impl Performer {
@@ -944,9 +1250,38 @@ impl Perform for Performer {
                 self.screen.lock().unwrap().set_title(title);
             }
         }
+        // OSC 8 ; params ; URI starts a hyperlink region. An empty URI closes it.
+        if params.first().is_some_and(|param| *param == b"8") {
+            let mut uri_bytes = Vec::new();
+            for (index, part) in params.iter().skip(2).enumerate() {
+                if index > 0 {
+                    uri_bytes.push(b';');
+                }
+                uri_bytes.extend_from_slice(part);
+            }
+            let uri = std::str::from_utf8(&uri_bytes)
+                .ok()
+                .filter(|uri| !uri.is_empty() && !uri.chars().any(char::is_control));
+            self.screen.lock().unwrap().set_hyperlink(uri);
+        }
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _: bool, action: char) {
+        // DECSCUSR: `CSI Ps SP q` selects the cursor shape and blink.
+        if action == 'q' && intermediates.contains(&b' ') {
+            let ps = param_raw(params, 0);
+            let style = CursorStyle {
+                shape: match ps {
+                    3 | 4 => CursorShape::Underline,
+                    5 | 6 => CursorShape::Bar,
+                    _ => CursorShape::Block,
+                },
+                blink: matches!(ps, 0 | 1 | 3 | 5),
+            };
+            self.screen.lock().unwrap().set_cursor_style(style);
+            return;
+        }
+
         // DEC private modes (`CSI ? Pm h` / `CSI ? Pm l`): alternate screen
         // buffer and cursor visibility. Full-screen editors rely on these.
         if intermediates.contains(&b'?') {
@@ -975,6 +1310,7 @@ impl Perform for Performer {
                         1002 => screen.set_mouse_mode(MouseMode::Button, enable),
                         1003 => screen.set_mouse_mode(MouseMode::Any, enable),
                         1006 => screen.set_mouse_sgr(enable),
+                        2026 => self.sync_output.store(enable, Ordering::Release),
                         _ => {}
                     }
                 }
@@ -1077,7 +1413,10 @@ impl Perform for Performer {
                 screen.linefeed();
             }
             b'M' => screen.reverse_index(),
-            b'c' => screen.reset(),
+            b'c' => {
+                screen.reset();
+                self.sync_output.store(false, Ordering::Release);
+            }
             _ => {}
         }
     }
@@ -1094,6 +1433,8 @@ pub struct Pty {
     dirty: Arc<AtomicBool>,
     /// Current PTY size, so no-op resizes do not signal the child with WINCH.
     size: Mutex<(u16, u16)>,
+    /// DECSET 2026 state, readable without locking the screen.
+    sync_output: Arc<AtomicBool>,
 }
 
 impl Pty {
@@ -1142,6 +1483,8 @@ impl Pty {
         let alive_clone = Arc::clone(&alive);
         let dirty = Arc::new(AtomicBool::new(false));
         let dirty_clone = Arc::clone(&dirty);
+        let sync_output = Arc::new(AtomicBool::new(false));
+        let sync_clone = Arc::clone(&sync_output);
 
         thread::Builder::new()
             .name("pty-reader".into())
@@ -1150,6 +1493,7 @@ impl Pty {
                 let mut performer = Performer {
                     screen: screen_clone,
                     writer: writer_clone,
+                    sync_output: sync_clone,
                 };
                 let mut buf = [0u8; 16384];
                 loop {
@@ -1178,12 +1522,21 @@ impl Pty {
             alive,
             dirty,
             size: Mutex::new((cols, rows)),
+            sync_output,
         })
     }
 
-    /// Returns whether the screen changed since the last call.
+    /// Returns whether the screen changed since the last call. While DECSET
+    /// 2026 is active, updates are coalesced until the program turns it off.
     pub fn take_dirty(&self) -> bool {
-        self.dirty.swap(false, Ordering::AcqRel)
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        !self.sync_output.load(Ordering::Acquire)
+    }
+
+    pub fn is_synchronized(&self) -> bool {
+        self.sync_output.load(Ordering::Acquire)
     }
 
     /// True while the child shell is still running.
@@ -1260,6 +1613,12 @@ mod tests {
         }
     }
 
+    fn feed(parser: &mut Parser, performer: &mut Performer, bytes: &[u8]) {
+        for byte in bytes {
+            parser.advance(performer, *byte);
+        }
+    }
+
     fn performer() -> (Performer, Arc<Mutex<Vec<u8>>>) {
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(SharedVec(Arc::clone(&output)))));
@@ -1267,6 +1626,7 @@ mod tests {
             Performer {
                 screen: Arc::new(Mutex::new(Screen::new(20, 4, 100))),
                 writer,
+                sync_output: Arc::new(AtomicBool::new(false)),
             },
             output,
         )
@@ -1286,7 +1646,7 @@ mod tests {
         text.chars()
             .map(|ch| Cell {
                 ch,
-                style: Style::default(),
+                ..Cell::default()
             })
             .collect()
     }
@@ -1538,5 +1898,118 @@ mod tests {
         }
         let lines = screen.visible_lines();
         assert_eq!(lines, vec!["two".to_owned(), "three".to_owned()]);
+    }
+
+    #[test]
+    fn osc8_hyperlinks_attach_to_printed_cells() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        feed(
+            &mut parser,
+            &mut performer,
+            b"\x1b]8;;https://example.com/a;b\x07",
+        );
+        performer.screen.lock().unwrap().print('x');
+        let screen = performer.screen.lock().unwrap();
+        let (uri, start, end) = screen.link_at(0, 0).expect("hyperlink on cell");
+        assert_eq!(uri, "https://example.com/a;b");
+        assert_eq!((start, end), (0, 0));
+        drop(screen);
+
+        feed(&mut parser, &mut performer, b"\x1b]8;;\x07");
+        performer.screen.lock().unwrap().print('y');
+        assert!(performer.screen.lock().unwrap().link_at(0, 1).is_none());
+    }
+
+    #[test]
+    fn double_width_characters_advance_two_cells() {
+        let mut screen = Screen::new(5, 2, 10);
+        screen.print('😀');
+        screen.print('x');
+        assert_eq!(screen.visible_lines()[0], "😀x");
+        assert_eq!(screen.cursor(), (0, 3));
+        assert!(screen.display_row(0)[1].wide);
+    }
+
+    #[test]
+    fn emoji_presentation_selector_widens_the_previous_cell() {
+        let mut screen = Screen::new(5, 2, 10);
+        screen.print('\u{2764}');
+        screen.print('\u{FE0F}');
+        screen.print('x');
+        assert_eq!(screen.cursor(), (0, 3));
+        assert!(screen.display_row(0)[1].wide);
+    }
+
+    #[test]
+    fn combining_marks_do_not_advance_the_cursor() {
+        let mut screen = Screen::new(5, 2, 10);
+        screen.print('e');
+        screen.print('\u{0301}');
+        assert_eq!(screen.cursor(), (0, 1));
+        assert_eq!(screen.visible_lines()[0], "e\u{0301}");
+    }
+
+    #[test]
+    fn adds_dim_italic_blink_and_strikethrough_attributes() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        feed(&mut parser, &mut performer, b"\x1b[2;3;4;5;9mX");
+        let screen = performer.screen.lock().unwrap();
+        let style = screen.display_row(0)[0].style;
+        assert!(style.dim && style.italic && style.underline);
+        assert!(style.blink && style.strikethrough);
+    }
+
+    #[test]
+    fn decscusr_selects_cursor_shape_and_blink() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        feed(&mut parser, &mut performer, b"\x1b[5 q");
+        let style = performer.screen.lock().unwrap().cursor_style();
+        assert_eq!(style.shape, CursorShape::Bar);
+        assert!(style.blink);
+    }
+
+    #[test]
+    fn decset_2026_toggles_synchronized_output() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        feed(&mut parser, &mut performer, b"\x1b[?2026h");
+        assert!(
+            performer
+                .sync_output
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        feed(&mut parser, &mut performer, b"\x1b[?2026l");
+        assert!(
+            !performer
+                .sync_output
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn search_finds_scrollback_newest_first() {
+        let mut screen = Screen::new(20, 4, 100);
+        screen.push_scrollback(styled_row("first line"));
+        screen.push_scrollback(styled_row("second Line"));
+        let mut hits = Vec::new();
+        screen.search_history("line", 10, &mut hits);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, 1);
+        assert!(hits[0].1.contains("second Line"));
+        assert_eq!(hits[1].0, 0);
+    }
+
+    #[test]
+    fn scrolling_reaches_the_full_scrollback() {
+        let mut screen = Screen::new(10, 2, 100);
+        for i in 0..10 {
+            screen.push_scrollback(styled_row(&format!("H{i}")));
+        }
+        screen.set_scroll_offset(5);
+        assert_eq!(row_string(screen.display_row(0)), "H5");
+        assert_eq!(row_string(screen.display_row(1)), "H6");
     }
 }

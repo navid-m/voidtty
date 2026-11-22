@@ -18,6 +18,7 @@ glfw = "0.58"
 png = "0.17"
 portable-pty = "0.8"
 rustybuzz = "0.20.1"
+unicode-width = "0.2"
 vte = "0.13"
 
 [target.'cfg(windows)'.build-dependencies]

@@ -22,6 +22,18 @@ pub fn handle_event(
         return Ok(false);
     }
 
+    if app.search.is_some() {
+        match key {
+            Key::Escape => app.close_search(),
+            Key::Enter => app.activate_search_hit(),
+            Key::Up => app.search_move(-1),
+            Key::Down => app.search_move(1),
+            Key::Backspace => app.search_backspace(),
+            _ => {}
+        }
+        return Ok(true);
+    }
+
     let ctrl_shift = mods.contains(Modifiers::Control | Modifiers::Shift);
     let ctrl = mods.contains(Modifiers::Control) && !mods.contains(Modifiers::Shift);
 
@@ -84,6 +96,10 @@ pub fn handle_event(
             }
             Key::X => {
                 app.close_focused_pane();
+                return Ok(true);
+            }
+            Key::Slash => {
+                app.open_search();
                 return Ok(true);
             }
             Key::Tab => {

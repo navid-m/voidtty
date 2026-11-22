@@ -856,6 +856,8 @@ impl Renderer {
         &mut self,
         text: &str,
         colors: &[(f32, f32, f32)],
+        cell_map: Option<&[usize]>,
+        italics: Option<&[bool]>,
         px: f32,
         py: f32,
         alpha: f32,
@@ -873,7 +875,13 @@ impl Renderer {
         let byte_to_cell: Vec<(u32, usize)> = text
             .char_indices()
             .enumerate()
-            .map(|(cell, (byte, _))| (byte as u32, cell))
+            .map(|(cell, (byte, _))| {
+                let cell = cell_map
+                    .and_then(|map| map.get(cell))
+                    .copied()
+                    .unwrap_or(cell);
+                (byte as u32, cell)
+            })
             .collect();
         let cell_for =
             |cluster: u32| match byte_to_cell.binary_search_by_key(&cluster, |&(byte, _)| byte) {
@@ -960,10 +968,21 @@ impl Renderer {
             let y0 = (baseline - gm.bh - gm.yoff - rg.y_offset).round();
             let x1 = x0 + gm.bw;
             let y1 = y0 + gm.bh;
+            // Synthetic oblique: shift the top edge right for italic cells.
+            let top = if italics
+                .and_then(|styles| styles.get(rg.cell))
+                .copied()
+                .unwrap_or(false)
+            {
+                (y1 - y0) * 0.22
+            } else {
+                0.0
+            };
+            let (tx0, tx1) = (x0 + top, x1 + top);
 
             self.text_verts.extend_from_slice(&[
                 TV {
-                    x: x0,
+                    x: tx0,
                     y: y0,
                     u: gm.u0,
                     v: gm.v0,
@@ -973,7 +992,7 @@ impl Renderer {
                     a: alpha,
                 },
                 TV {
-                    x: x1,
+                    x: tx1,
                     y: y0,
                     u: gm.u1,
                     v: gm.v0,
@@ -993,7 +1012,7 @@ impl Renderer {
                     a: alpha,
                 },
                 TV {
-                    x: x1,
+                    x: tx1,
                     y: y0,
                     u: gm.u1,
                     v: gm.v0,
