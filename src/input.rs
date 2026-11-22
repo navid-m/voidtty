@@ -53,19 +53,19 @@ pub fn handle_event(
                 return Ok(true);
             }
             Key::Left => {
-                app.resize_focused(SplitDir::Horizontal, 0.05);
-                return Ok(true);
-            }
-            Key::Right => {
                 app.resize_focused(SplitDir::Horizontal, -0.05);
                 return Ok(true);
             }
+            Key::Right => {
+                app.resize_focused(SplitDir::Horizontal, 0.05);
+                return Ok(true);
+            }
             Key::Up => {
-                app.resize_focused(SplitDir::Vertical, 0.05);
+                app.resize_focused(SplitDir::Vertical, -0.05);
                 return Ok(true);
             }
             Key::Down => {
-                app.resize_focused(SplitDir::Vertical, -0.05);
+                app.resize_focused(SplitDir::Vertical, 0.05);
                 return Ok(true);
             }
             Key::LeftBracket => {
