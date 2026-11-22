@@ -2,13 +2,17 @@ mod app;
 mod config;
 mod font;
 mod input;
+mod opener;
 mod renderer;
 mod terminal;
 mod ui;
 
 use anyhow::{Context, Result};
 use glfw::{Context as _, GlfwReceiver, OpenGlProfileHint, WindowEvent, WindowHint, WindowMode};
-use std::env;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use app::{App, SplitDir};
 use config::Config;
@@ -170,6 +174,11 @@ fn process_events(
     let mut redraw = false;
     for (_, event) in glfw::flush_messages(events) {
         match event {
+            WindowEvent::Focus(false) => {
+                app.ctrl_down = false;
+                app.hover_link = None;
+                redraw = true;
+            }
             WindowEvent::Refresh | WindowEvent::Focus(true) | WindowEvent::Iconify(false) => {
                 // The compositor may have discarded the back buffer while the
                 // window was hidden or iconified; force a full repaint.
@@ -215,6 +224,7 @@ fn process_events(
                 }
                 app.selection = None;
                 redraw = true;
+                redraw |= update_hover_link(app, renderer, ui, mx, my);
             }
             WindowEvent::CursorPos(x, y) => {
                 if let Some(drag) = app.split_drag.clone() {
@@ -299,6 +309,8 @@ fn process_events(
                         }
                     }
                 }
+                redraw |=
+                    update_hover_link(app, renderer, ui, x as f32 * ui.scale, y as f32 * ui.scale);
             }
             WindowEvent::MouseButton(_, glfw::Action::Release, mods) => {
                 if app.split_drag.take().is_some() {
@@ -366,6 +378,32 @@ fn process_events(
                         redraw = true;
                         continue;
                     }
+                }
+
+                // Ctrl + left click on a path or URL opens it.
+                if mods.contains(glfw::Modifiers::Control)
+                    && button == glfw::MouseButton::Button1
+                    && let Some(link) = link_at(app, renderer, ui, mx, my)
+                {
+                    app.focused = link.pane;
+                    app.selection = None;
+                    app.selecting = false;
+                    app.mouse_pressed = None;
+                    match &link.target {
+                        app::LinkTarget::Url(url) => {
+                            if let Err(e) = opener::open_url(url) {
+                                eprintln!("voidtty: {e:#}");
+                            }
+                        }
+                        app::LinkTarget::Path(path) => {
+                            if let Err(e) = opener::reveal_path(path) {
+                                eprintln!("voidtty: {e:#}");
+                            }
+                        }
+                    }
+                    app.hover_link = None;
+                    redraw = true;
+                    continue;
                 }
 
                 let mut grabbed_scrollbar = false;
@@ -460,11 +498,21 @@ fn process_events(
                                             my,
                                         )
                                     {
-                                        app.selection = Some(app::Selection {
-                                            pane: id,
-                                            anchor: cell,
-                                            cursor: cell,
-                                        });
+                                        let cols = pane.active().pty.screen.lock().unwrap().cols();
+                                        let double = app.register_click(id, cell.0);
+                                        if double {
+                                            app.selection = Some(app::Selection {
+                                                pane: id,
+                                                anchor: (cell.0, 0),
+                                                cursor: (cell.0, cols.saturating_sub(1)),
+                                            });
+                                        } else {
+                                            app.selection = Some(app::Selection {
+                                                pane: id,
+                                                anchor: cell,
+                                                cursor: cell,
+                                            });
+                                        }
                                         app.selecting = true;
                                     }
                                 }
@@ -478,7 +526,12 @@ fn process_events(
                 }
             }
             ev => {
+                let ctrl_before = app.ctrl_down;
                 input::handle_event(ev, app, clipboard)?;
+                if app.ctrl_down != ctrl_before {
+                    let (x, y) = window.get_cursor_pos();
+                    update_hover_link(app, renderer, ui, x as f32 * ui.scale, y as f32 * ui.scale);
+                }
                 redraw = true;
             }
         }
@@ -522,6 +575,195 @@ fn cell_at(
         row.clamp(0.0, (rows - 1) as f32) as usize,
         col.clamp(0.0, (cols - 1) as f32) as usize,
     ))
+}
+
+/// Updates the hovered link for the current pointer position. Returns whether
+/// the hover state changed (so the frame needs repainting).
+fn update_hover_link(app: &mut App, renderer: &Renderer, ui: UiMetrics, mx: f32, my: f32) -> bool {
+    let next =
+        if app.ctrl_down && app.split_drag.is_none() && !app.selecting && app.scroll_drag.is_none()
+        {
+            link_at(app, renderer, ui, mx, my)
+        } else {
+            None
+        };
+    let changed = next != app.hover_link;
+    if changed {
+        app.hover_link = next;
+    }
+    changed
+}
+
+/// Finds a path or URL token under a window position.
+fn link_at(
+    app: &App,
+    renderer: &Renderer,
+    ui: UiMetrics,
+    mx: f32,
+    my: f32,
+) -> Option<app::HoverLink> {
+    let rects = pane_layout(app, renderer);
+    let id = ui::hit_pane(mx, my, &rects)?;
+    let rect = rects
+        .iter()
+        .find(|(pane_id, _)| *pane_id == id)
+        .map(|(_, rect)| *rect)?;
+    let pane = app.pane(id)?;
+    link_in_pane(
+        pane,
+        rect,
+        ui,
+        renderer.cell_w(),
+        renderer.line_height(),
+        mx,
+        my,
+    )
+}
+
+fn link_in_pane(
+    pane: &app::Pane,
+    rect: Rect,
+    ui: UiMetrics,
+    cell_w: f32,
+    line_h: f32,
+    mx: f32,
+    my: f32,
+) -> Option<app::HoverLink> {
+    let content = pane_content(rect, ui.tab_bar_h);
+    let text_x0 = content.x + ui.pane_pad;
+    let text_y0 = content.y + ui.pane_pad;
+    let text_x1 = content.x + content.w - ui.pane_pad - ui.scrollbar_gutter;
+    let text_y1 = content.y + content.h - ui.pane_pad;
+    if mx < text_x0 || mx >= text_x1 || my < text_y0 || my >= text_y1 {
+        return None;
+    }
+    let (row, col) = cell_at(pane, rect, ui, cell_w, line_h, mx, my)?;
+    let chars: Vec<char> = {
+        let screen = pane.active().pty.screen.lock().unwrap();
+        screen.display_row(row).iter().map(|cell| cell.ch).collect()
+    };
+
+    let mut i = 0;
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        let end = i;
+        if col < start || col >= end {
+            continue;
+        }
+        let (target, token_start, token_end) = classify_token(&chars[start..end])?;
+        return Some(app::HoverLink {
+            pane: pane.id,
+            row,
+            start_col: start + token_start,
+            end_col: start + token_end - 1,
+            target,
+        });
+    }
+    None
+}
+
+/// Classifies a whitespace-delimited token as a URL or an existing path,
+/// trimming surrounding punctuation where needed.
+fn classify_token(chars: &[char]) -> Option<(app::LinkTarget, usize, usize)> {
+    let mut start = 0;
+    let mut end = chars.len();
+    while start < end && matches!(chars[start], '(' | '[' | '{' | '<' | '\'' | '"') {
+        start += 1;
+    }
+    loop {
+        let token: String = chars[start..end].iter().collect();
+        if let Some(target) = classify_text(&token) {
+            // URLs are prefix-matched, so strip trailing sentence punctuation
+            // before accepting them (paths are already existence-checked).
+            let needs_trim =
+                matches!(target, app::LinkTarget::Url(_)) && trim_trailing(chars, start, end);
+            if !needs_trim {
+                return Some((target, start, end));
+            }
+        }
+        if end <= start || !trim_trailing(chars, start, end) {
+            break;
+        }
+        end -= 1;
+    }
+    None
+}
+
+fn classify_text(token: &str) -> Option<app::LinkTarget> {
+    if let Some(rest) = token.strip_prefix("file://") {
+        let path = expand_home(rest);
+        if path.exists() {
+            return Some(app::LinkTarget::Path(path));
+        }
+    }
+
+    let lower = token.to_ascii_lowercase();
+    let is_url = lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("ftp://")
+        || lower.starts_with("www.")
+        || lower.starts_with("mailto:");
+    if is_url {
+        return Some(app::LinkTarget::Url(token.to_owned()));
+    }
+    if let Some(pos) = token.find("://") {
+        let scheme = &token[..pos];
+        if !scheme.is_empty()
+            && scheme
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        {
+            return Some(app::LinkTarget::Url(token.to_owned()));
+        }
+    }
+
+    let path = expand_home(token);
+    if path.exists() {
+        return Some(app::LinkTarget::Path(path));
+    }
+    None
+}
+
+/// Whether the final character can be stripped as sentence punctuation.
+fn trim_trailing(chars: &[char], start: usize, end: usize) -> bool {
+    let c = chars[end - 1];
+    if c == ')' || c == ']' || c == '}' {
+        let open = match c {
+            ')' => '(',
+            ']' => '[',
+            _ => '{',
+        };
+        let opens = chars[start..end].iter().filter(|&&ch| ch == open).count();
+        let closes = chars[start..end].iter().filter(|&&ch| ch == c).count();
+        return closes > opens;
+    }
+    matches!(
+        c,
+        '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '`' | '>' | '…'
+    )
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok();
+    if let Some(home) = home {
+        if path == "~" {
+            return PathBuf::from(home);
+        }
+        if let Some(rest) = path.strip_prefix("~/") {
+            return Path::new(&home).join(rest);
+        }
+    }
+    PathBuf::from(path)
 }
 
 /// xterm button code for a physical mouse button (wheels use `Scroll` events).
@@ -751,6 +993,7 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
     for (id, rect) in pane_layout(app, renderer) {
         let Some(pane) = app.pane(id) else { continue };
         let selection = app.selection.filter(|selection| selection.pane == id);
+        let hover = app.hover_link.as_ref().filter(|hover| hover.pane == id);
         draw_pane(
             renderer,
             pane,
@@ -758,8 +1001,10 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics) -> Result<()> {
             id == app.focused,
             ui,
             opacity,
+            &app.config,
             &mut rows,
             selection,
+            hover,
         )?;
     }
 
@@ -774,19 +1019,24 @@ fn draw_pane(
     focused: bool,
     ui: UiMetrics,
     opacity: f32,
+    config: &Config,
     rows: &mut Vec<Vec<Cell>>,
     selection: Option<app::Selection>,
+    hover: Option<&app::HoverLink>,
 ) -> Result<()> {
     // Pane background.
     renderer.draw_rect(rect.x, rect.y, rect.w, rect.h, 0.0, 0.0, 0.0, opacity);
 
     // Border highlight for the focused pane.
     if focused {
-        let t = 1.5 * ui.scale;
-        renderer.draw_rect(rect.x, rect.y, rect.w, t, 0.3, 0.7, 1.0, 0.8);
-        renderer.draw_rect(rect.x, rect.y, t, rect.h, 0.3, 0.7, 1.0, 0.8);
-        renderer.draw_rect(rect.x, rect.y + rect.h - t, rect.w, t, 0.3, 0.7, 1.0, 0.8);
-        renderer.draw_rect(rect.x + rect.w - t, rect.y, t, rect.h, 0.3, 0.7, 1.0, 0.8);
+        let t = config.active_pane_thickness.max(0.0) * ui.scale;
+        if t > 0.0 {
+            let (r, g, b) = config.active_pane_colour;
+            renderer.draw_rect(rect.x, rect.y, rect.w, t, r, g, b, 0.8);
+            renderer.draw_rect(rect.x, rect.y, t, rect.h, r, g, b, 0.8);
+            renderer.draw_rect(rect.x, rect.y + rect.h - t, rect.w, t, r, g, b, 0.8);
+            renderer.draw_rect(rect.x + rect.w - t, rect.y, t, rect.h, r, g, b, 0.8);
+        }
     } else {
         let t = ui.scale;
         let c = 0.2f32;
@@ -837,6 +1087,9 @@ fn draw_pane(
                 let end_col = if row == end.0 { end.1 + 1 } else { cells.len() };
                 last = last.max(end_col.min(cells.len()));
             }
+        }
+        if let Some(hover) = hover.filter(|hover| hover.row == row) {
+            last = last.max((hover.end_col + 1).min(cells.len()));
         }
         if last == 0 {
             continue;
@@ -889,7 +1142,22 @@ fn draw_pane(
                 run_start = None;
             }
             let x = content.x + ui.pane_pad + col as f32 * cw;
-            if style.underline {
+            let hovered = hover.is_some_and(|hover| {
+                hover.row == row && col >= hover.start_col && col <= hover.end_col
+            });
+            if hovered {
+                let thickness = (1.5 * ui.scale).max(1.0);
+                renderer.draw_rect(
+                    x,
+                    y + lh - thickness,
+                    cw,
+                    thickness,
+                    0.45,
+                    0.75,
+                    1.0,
+                    opacity,
+                );
+            } else if style.underline {
                 renderer.draw_rect(x, y + lh - 1.5, cw, 1.0, fg.0, fg.1, fg.2, opacity);
             }
             if crate::renderer::is_block_element(cell.ch) {
@@ -1094,4 +1362,39 @@ fn fallback_font(config: &Config) -> font::LoadedFont {
         face_index: 0,
         family: "bundled fallback".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classify(value: &str) -> Option<(app::LinkTarget, usize, usize)> {
+        let chars: Vec<char> = value.chars().collect();
+        classify_token(&chars)
+    }
+
+    #[test]
+    fn urls_strip_surrounding_punctuation() {
+        let (target, start, end) = classify("(https://example.com).").unwrap();
+        assert_eq!(target, app::LinkTarget::Url("https://example.com".into()));
+        assert_eq!((start, end), (1, 20));
+    }
+
+    #[test]
+    fn balanced_parentheses_remain_part_of_urls() {
+        let url = "https://en.wikipedia.org/wiki/Foo_(bar)";
+        let (target, _, end) = classify(url).unwrap();
+        assert_eq!(target, app::LinkTarget::Url(url.into()));
+        assert_eq!(end, url.chars().count());
+    }
+
+    #[test]
+    fn existing_relative_paths_are_recognised() {
+        let path = Path::new("Cargo.toml");
+        if !path.exists() {
+            return;
+        }
+        let (target, _, _) = classify("Cargo.toml").unwrap();
+        assert_eq!(target, app::LinkTarget::Path(path.to_path_buf()));
+    }
 }

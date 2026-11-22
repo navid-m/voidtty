@@ -12,6 +12,12 @@ pub fn handle_event(
     let WindowEvent::Key(key, _, action, mods) = event else {
         return Ok(false);
     };
+    let is_ctrl_key = matches!(key, Key::LeftControl | Key::RightControl);
+    app.ctrl_down = if is_ctrl_key {
+        action != Action::Release
+    } else {
+        mods.contains(Modifiers::Control)
+    };
     if action == Action::Release {
         return Ok(false);
     }
@@ -152,6 +158,7 @@ pub fn handle_event(
 
     if !bytes.is_empty() {
         app.selection = None;
+        snap_to_live_screen(app);
         app.active_pane_mut().active_mut().pty.write(&bytes)?;
     }
     Ok(false)
@@ -160,9 +167,22 @@ pub fn handle_event(
 /// Handles a Unicode character event from GLFW (fires for printable chars).
 pub fn handle_char(c: char, app: &mut App) -> Result<()> {
     app.selection = None;
+    snap_to_live_screen(app);
     let mut buf = [0u8; 4];
     let s = c.encode_utf8(&mut buf);
     app.active_pane_mut().active_mut().pty.write(s.as_bytes())
+}
+
+fn snap_to_live_screen(app: &mut App) {
+    if app.config.active_keypress_snap {
+        app.active_pane_mut()
+            .active()
+            .pty
+            .screen
+            .lock()
+            .unwrap()
+            .set_scroll_offset(0);
+    }
 }
 
 fn key_to_bytes(key: Key, mods: Modifiers) -> Vec<u8> {

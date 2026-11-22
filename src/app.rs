@@ -4,6 +4,10 @@ use crate::{
     ui::Rect,
 };
 use anyhow::Result;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 /// One tab within a pane: a single PTY session.
 pub struct Tab {
@@ -249,6 +253,30 @@ pub struct Selection {
     pub cursor: (usize, usize),
 }
 
+/// Something a Ctrl+click can open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkTarget {
+    Url(String),
+    Path(PathBuf),
+}
+
+/// A path or URL under the pointer while Ctrl is held.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoverLink {
+    pub pane: usize,
+    pub row: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+    pub target: LinkTarget,
+}
+
+/// Details of the last mouse press, used to detect double-clicks.
+struct LastClick {
+    pane: usize,
+    row: usize,
+    at: Instant,
+}
+
 impl Selection {
     /// Selection endpoints ordered top-left to bottom-right.
     pub fn range(&self) -> ((usize, usize), (usize, usize)) {
@@ -285,6 +313,11 @@ pub struct App {
     pub selecting: bool,
     /// Pane and xterm button code of a press forwarded to the running program.
     pub mouse_pressed: Option<(usize, u8)>,
+    /// Whether a Ctrl modifier key is currently held.
+    pub ctrl_down: bool,
+    /// Path or URL under the pointer while Ctrl is held.
+    pub hover_link: Option<HoverLink>,
+    last_click: Option<LastClick>,
     next_pane_id: usize,
     next_accent: usize,
 }
@@ -303,6 +336,9 @@ impl App {
             selection: None,
             selecting: false,
             mouse_pressed: None,
+            ctrl_down: false,
+            hover_link: None,
+            last_click: None,
             next_pane_id: 0,
             next_accent: 0,
         };
@@ -337,6 +373,19 @@ impl App {
 
     pub fn active_pane_mut(&mut self) -> &mut Pane {
         self.pane_mut(self.focused).expect("focused pane exists")
+    }
+
+    /// Records a press at a pane row and reports whether it completes a
+    /// double-click on the same row of the same pane.
+    pub fn register_click(&mut self, pane: usize, row: usize) -> bool {
+        let now = Instant::now();
+        let double = self.last_click.as_ref().is_some_and(|last| {
+            last.pane == pane
+                && last.row == row
+                && now.duration_since(last.at) <= Duration::from_millis(400)
+        });
+        self.last_click = Some(LastClick { pane, row, at: now });
+        double
     }
 
     /// Opens a new tab in the currently focused pane.

@@ -23,6 +23,12 @@ pub struct Config {
     pub win_width: u32,
     /// Initial window height in pixels.
     pub win_height: u32,
+    /// Thickness of the focused pane border, in logical pixels.
+    pub active_pane_thickness: f32,
+    /// RGB colour of the focused pane border.
+    pub active_pane_colour: (f32, f32, f32),
+    /// Whether typing in a scrolled-up pane jumps back to the live screen.
+    pub active_keypress_snap: bool,
 }
 
 impl Default for Config {
@@ -35,6 +41,9 @@ impl Default for Config {
             scrollback: 10_000,
             win_width: 1280,
             win_height: 800,
+            active_pane_thickness: 1.5,
+            active_pane_colour: (0.3, 0.7, 1.0),
+            active_keypress_snap: true,
         }
     }
 }
@@ -117,6 +126,21 @@ impl Config {
                         cfg.win_height = v;
                     }
                 }
+                "active_pane_thickness" => {
+                    if let Ok(v) = val.parse::<f32>() {
+                        cfg.active_pane_thickness = v.max(0.0);
+                    }
+                }
+                "active_pane_colour" => {
+                    if let Some(colour) = parse_colour(val) {
+                        cfg.active_pane_colour = colour;
+                    }
+                }
+                "active_keypress_snap" => {
+                    if let Some(v) = parse_bool(val) {
+                        cfg.active_keypress_snap = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -135,7 +159,12 @@ impl Config {
              font_size = {:.1}\n\
              scrollback = {}\n\
              win_width = {}\n\
-             win_height = {}\n",
+             win_height = {}\n\
+             ; Thickness and colour (#RRGGBB) of the focused pane border.\n\
+             active_pane_thickness = {:.1}\n\
+             active_pane_colour = {}\n\
+             ; Jump back to the live screen when typing while scrolled up.\n\
+             active_keypress_snap = {}\n",
             self.opacity,
             self.shell,
             self.font_family,
@@ -143,6 +172,82 @@ impl Config {
             self.scrollback,
             self.win_width,
             self.win_height,
+            self.active_pane_thickness,
+            colour_hex(self.active_pane_colour),
+            self.active_keypress_snap,
         )
+    }
+}
+
+/// Parses `#RRGGBB` or `#RGB` into display components in [0, 1].
+fn parse_colour(value: &str) -> Option<(f32, f32, f32)> {
+    let hex = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    if hex.len() != 3 && hex.len() != 6 {
+        return None;
+    }
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut chars = hex.chars();
+    let r = if hex.len() == 3 {
+        (chars.next()?.to_digit(16)? * 17) as u8
+    } else {
+        u8::from_str_radix(&hex[0..2], 16).ok()?
+    };
+    let g = if hex.len() == 3 {
+        (chars.next()?.to_digit(16)? * 17) as u8
+    } else {
+        u8::from_str_radix(&hex[2..4], 16).ok()?
+    };
+    let b = if hex.len() == 3 {
+        (chars.next()?.to_digit(16)? * 17) as u8
+    } else {
+        u8::from_str_radix(&hex[4..6], 16).ok()?
+    };
+    Some((r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0))
+}
+
+fn colour_hex((r, g, b): (f32, f32, f32)) -> String {
+    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02X}{:02X}{:02X}", channel(r), channel(g), channel(b))
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_active_pane_and_snap_settings() {
+        let cfg = Config::parse_ini(
+            "active_pane_thickness = 3\n\
+             active_pane_colour = #ff8800\n\
+             active_keypress_snap = false\n",
+        );
+        assert!((cfg.active_pane_thickness - 3.0).abs() < f32::EPSILON);
+        let (r, g, b) = cfg.active_pane_colour;
+        assert!((r - 1.0).abs() < 0.01);
+        assert!((g - 136.0 / 255.0).abs() < 0.01);
+        assert!(b.abs() < 0.01);
+        assert!(!cfg.active_keypress_snap);
+    }
+
+    #[test]
+    fn default_active_pane_style_preserves_previous_border() {
+        let cfg = Config::default();
+        assert!((cfg.active_pane_thickness - 1.5).abs() < f32::EPSILON);
+        let (r, g, b) = cfg.active_pane_colour;
+        assert!((r - 0.3).abs() < 0.01);
+        assert!((g - 0.7).abs() < 0.01);
+        assert!((b - 1.0).abs() < 0.01);
+        assert!(cfg.active_keypress_snap);
+        assert!(cfg.to_ini().contains("active_pane_colour = #4DB3FF"));
     }
 }
