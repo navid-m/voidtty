@@ -1,11 +1,6 @@
 # voidtty
 
-Simple terminal emulator for personal use.
-
-- New horizontal pane: Ctrl+Shift+E
-- New vertical pane: Ctrl+Shift+O
-- New tab in current pane: Ctrl+Shift+T
-- Close tab: Ctrl+Shift+W
+Multiplexing terminal emulator with cross-pane search.
 
 ---
 
