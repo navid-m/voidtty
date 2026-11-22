@@ -34,6 +34,58 @@ pub struct GlyphAtlas {
     glyphs: HashMap<u16, GlyphMetrics>,
 }
 
+/// Fractional rectangle `(x0, y0, x1, y1)` within one terminal cell.
+type BlockRect = (f32, f32, f32, f32);
+
+/// Geometry for Unicode block elements. Rasterising these from the font puts
+/// their edges on fractional pixel coordinates, which leaves a visible seam
+/// between neighbouring cells (and full blocks come up a pixel short). Drawing
+/// them as exact cell rectangles keeps text-mode images seamless.
+fn block_element_rects(c: char) -> Option<([BlockRect; 2], usize, f32)> {
+    let none = (0.0, 0.0, 0.0, 0.0);
+    let rects: ([BlockRect; 2], usize, f32) = match c {
+        '\u{2580}' => ([(0.0, 0.0, 1.0, 0.5), none], 1, 1.0),
+        '\u{2581}' => ([(0.0, 0.875, 1.0, 1.0), none], 1, 1.0),
+        '\u{2582}' => ([(0.0, 0.75, 1.0, 1.0), none], 1, 1.0),
+        '\u{2583}' => ([(0.0, 0.625, 1.0, 1.0), none], 1, 1.0),
+        '\u{2584}' => ([(0.0, 0.5, 1.0, 1.0), none], 1, 1.0),
+        '\u{2585}' => ([(0.0, 0.375, 1.0, 1.0), none], 1, 1.0),
+        '\u{2586}' => ([(0.0, 0.25, 1.0, 1.0), none], 1, 1.0),
+        '\u{2587}' => ([(0.0, 0.125, 1.0, 1.0), none], 1, 1.0),
+        '\u{2588}' => ([(0.0, 0.0, 1.0, 1.0), none], 1, 1.0),
+        '\u{2589}' => ([(0.0, 0.0, 0.875, 1.0), none], 1, 1.0),
+        '\u{258A}' => ([(0.0, 0.0, 0.75, 1.0), none], 1, 1.0),
+        '\u{258B}' => ([(0.0, 0.0, 0.625, 1.0), none], 1, 1.0),
+        '\u{258C}' => ([(0.0, 0.0, 0.5, 1.0), none], 1, 1.0),
+        '\u{258D}' => ([(0.0, 0.0, 0.375, 1.0), none], 1, 1.0),
+        '\u{258E}' => ([(0.0, 0.0, 0.25, 1.0), none], 1, 1.0),
+        '\u{258F}' => ([(0.0, 0.0, 0.125, 1.0), none], 1, 1.0),
+        '\u{2590}' => ([(0.5, 0.0, 1.0, 1.0), none], 1, 1.0),
+        '\u{2591}' => ([(0.0, 0.0, 1.0, 1.0), none], 1, 0.25),
+        '\u{2592}' => ([(0.0, 0.0, 1.0, 1.0), none], 1, 0.5),
+        '\u{2593}' => ([(0.0, 0.0, 1.0, 1.0), none], 1, 0.75),
+        '\u{2594}' => ([(0.0, 0.0, 1.0, 0.125), none], 1, 1.0),
+        '\u{2595}' => ([(0.875, 0.0, 1.0, 1.0), none], 1, 1.0),
+        '\u{2596}' => ([(0.0, 0.5, 0.5, 1.0), none], 1, 1.0),
+        '\u{2597}' => ([(0.5, 0.5, 1.0, 1.0), none], 1, 1.0),
+        '\u{2598}' => ([(0.0, 0.0, 0.5, 0.5), none], 1, 1.0),
+        '\u{2599}' => ([(0.0, 0.0, 0.5, 1.0), (0.5, 0.5, 1.0, 1.0)], 2, 1.0),
+        '\u{259A}' => ([(0.0, 0.0, 0.5, 0.5), (0.5, 0.5, 1.0, 1.0)], 2, 1.0),
+        '\u{259B}' => ([(0.0, 0.0, 1.0, 0.5), (0.0, 0.5, 0.5, 1.0)], 2, 1.0),
+        '\u{259C}' => ([(0.0, 0.0, 1.0, 0.5), (0.5, 0.5, 1.0, 1.0)], 2, 1.0),
+        '\u{259D}' => ([(0.5, 0.0, 1.0, 0.5), none], 1, 1.0),
+        '\u{259E}' => ([(0.5, 0.0, 1.0, 0.5), (0.0, 0.5, 0.5, 1.0)], 2, 1.0),
+        '\u{259F}' => ([(0.5, 0.0, 1.0, 1.0), (0.0, 0.5, 0.5, 1.0)], 2, 1.0),
+        _ => return None,
+    };
+    Some(rects)
+}
+
+/// Whether `c` is a block element that should be drawn as cell geometry.
+pub fn is_block_element(c: char) -> bool {
+    block_element_rects(c).is_some()
+}
+
 /// One positioned glyph produced by the shaper.
 #[derive(Clone, Copy)]
 struct ShapedGlyph {
@@ -765,6 +817,38 @@ impl Renderer {
         shaped
     }
 
+    /// Fills a Unicode block element as exact cell rectangles, avoiding the
+    /// seams left by fractional glyph outlines.
+    pub fn draw_block_element(
+        &mut self,
+        c: char,
+        x: f32,
+        y: f32,
+        color: (f32, f32, f32),
+        alpha: f32,
+    ) {
+        let Some((rects, count, shade)) = block_element_rects(c) else {
+            return;
+        };
+        let w = self.cell_w();
+        let h = self.line_height();
+        for &(x0, y0, x1, y1) in &rects[..count] {
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            self.draw_rect(
+                x + x0 * w,
+                y + y0 * h,
+                (x1 - x0) * w,
+                (y1 - y0) * h,
+                color.0,
+                color.1,
+                color.2,
+                alpha * shade,
+            );
+        }
+    }
+
     /// Draws shaped text with one color per terminal cell. Ligatures are
     /// formed by the shaper and placed at the cell of their starting cluster.
     /// Characters the primary font lacks are taken from fallback fonts.
@@ -996,6 +1080,16 @@ unsafe fn get_uniform(prog: GLuint, name: &str) -> GLint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_elements_fill_whole_cells() {
+        let Some((rects, count, _)) = block_element_rects('\u{2588}') else {
+            panic!("full block should be drawn as geometry");
+        };
+        assert_eq!(count, 1);
+        assert_eq!(rects[0], (0.0, 0.0, 1.0, 1.0));
+        assert!(!is_block_element('A'));
+    }
 
     #[test]
     fn shapes_common_ligatures_when_font_supports_them() {

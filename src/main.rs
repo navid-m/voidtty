@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use glfw::{Context as _, GlfwReceiver, OpenGlProfileHint, WindowEvent, WindowHint, WindowMode};
 use std::env;
 
-use app::App;
+use app::{App, SplitDir};
 use config::Config;
 use renderer::Renderer;
 use terminal::{Cell, Color, MouseMode, Style};
@@ -189,7 +189,23 @@ fn process_events(
                 redraw = true;
             }
             WindowEvent::CursorPos(x, y) => {
-                if app.selecting
+                if let Some(drag) = app.split_drag.clone() {
+                    let mx = x as f32 * ui.scale;
+                    let my = y as f32 * ui.scale;
+                    let ratio = match drag.dir {
+                        SplitDir::Horizontal if drag.area.w > 0.0 => {
+                            (mx - drag.area.x) / drag.area.w
+                        }
+                        SplitDir::Vertical if drag.area.h > 0.0 => (my - drag.area.y) / drag.area.h,
+                        _ => 0.5,
+                    };
+                    if let Some(layout) = app.layout.as_mut()
+                        && layout.set_ratio(&drag.path, ratio)
+                    {
+                        app.needs_resize = true;
+                        redraw = true;
+                    }
+                } else if app.selecting
                     && let Some(mut selection) = app.selection
                 {
                     let rects = pane_layout(app, renderer);
@@ -257,6 +273,10 @@ fn process_events(
                 }
             }
             WindowEvent::MouseButton(_, glfw::Action::Release, mods) => {
+                if app.split_drag.take().is_some() {
+                    redraw = true;
+                    continue;
+                }
                 let mut reported = false;
                 if let Some((id, code)) = app.mouse_pressed.take() {
                     let mode = pane_mouse_mode(app, id);
@@ -298,6 +318,27 @@ fn process_events(
                 let mx = mx as f32 * ui.scale;
                 let my = my as f32 * ui.scale;
                 let rects = pane_layout(app, renderer);
+
+                // Ctrl + left drag on a split border resizes the panes.
+                if mods.contains(glfw::Modifiers::Control) && button == glfw::MouseButton::Button1 {
+                    let hit = app.layout.as_ref().and_then(|layout| {
+                        ui::hit_split(
+                            layout,
+                            Rect::new(0.0, 0.0, renderer.win_w, renderer.win_h),
+                            mx,
+                            my,
+                            4.0 * ui.scale,
+                        )
+                    });
+                    if let Some((path, dir, area)) = hit {
+                        app.split_drag = Some(app::SplitDrag { path, dir, area });
+                        app.selection = None;
+                        app.selecting = false;
+                        app.mouse_pressed = None;
+                        redraw = true;
+                        continue;
+                    }
+                }
 
                 let mut grabbed_scrollbar = false;
                 for (id, rect) in &rects {
@@ -823,7 +864,16 @@ fn draw_pane(
             if style.underline {
                 renderer.draw_rect(x, y + lh - 1.5, cw, 1.0, fg.0, fg.1, fg.2, opacity);
             }
-            text.push(cell.ch);
+            if crate::renderer::is_block_element(cell.ch) {
+                // End the background run so the block paints over its own cell.
+                flush_run(renderer, run_start, col, run_color);
+                run_start = None;
+                renderer.draw_block_element(cell.ch, x, y, fg, opacity);
+                // Keep the cell in the row so shaping still aligns to columns.
+                text.push(' ');
+            } else {
+                text.push(cell.ch);
+            }
             row_colors.push(fg);
         }
         flush_run(renderer, run_start, last, run_color);

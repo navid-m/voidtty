@@ -128,3 +128,107 @@ pub fn hit_pane(px: f32, py: f32, rects: &[(usize, Rect)]) -> Option<usize> {
         .find(|(_, r)| px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h)
         .map(|(id, _)| *id)
 }
+
+/// Finds the split border under a pixel position, if any. Returns the path to
+/// the split node, its direction and the rectangle it divides.
+pub fn hit_split(
+    node: &LayoutNode,
+    area: Rect,
+    px: f32,
+    py: f32,
+    tolerance: f32,
+) -> Option<(Vec<bool>, SplitDir, Rect)> {
+    fn walk(
+        node: &LayoutNode,
+        area: Rect,
+        px: f32,
+        py: f32,
+        tolerance: f32,
+        path: &mut Vec<bool>,
+        hit: &mut Option<(Vec<bool>, SplitDir, Rect)>,
+    ) {
+        let LayoutNode::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } = node
+        else {
+            return;
+        };
+        let ratio = ratio.clamp(0.1, 0.9);
+        match dir {
+            SplitDir::Horizontal => {
+                let w = area.w * ratio;
+                let divider = area.x + w;
+                if (px - divider).abs() <= tolerance && py >= area.y && py <= area.y + area.h {
+                    *hit = Some((path.clone(), *dir, area));
+                    return;
+                }
+                if px < divider {
+                    path.push(false);
+                    walk(
+                        first,
+                        Rect::new(area.x, area.y, w, area.h),
+                        px,
+                        py,
+                        tolerance,
+                        path,
+                        hit,
+                    );
+                    path.pop();
+                } else {
+                    path.push(true);
+                    walk(
+                        second,
+                        Rect::new(divider, area.y, area.w - w, area.h),
+                        px,
+                        py,
+                        tolerance,
+                        path,
+                        hit,
+                    );
+                    path.pop();
+                }
+            }
+            SplitDir::Vertical => {
+                let h = area.h * ratio;
+                let divider = area.y + h;
+                if (py - divider).abs() <= tolerance && px >= area.x && px <= area.x + area.w {
+                    *hit = Some((path.clone(), *dir, area));
+                    return;
+                }
+                if py < divider {
+                    path.push(false);
+                    walk(
+                        first,
+                        Rect::new(area.x, area.y, area.w, h),
+                        px,
+                        py,
+                        tolerance,
+                        path,
+                        hit,
+                    );
+                    path.pop();
+                } else {
+                    path.push(true);
+                    walk(
+                        second,
+                        Rect::new(area.x, divider, area.w, area.h - h),
+                        px,
+                        py,
+                        tolerance,
+                        path,
+                        hit,
+                    );
+                    path.pop();
+                }
+            }
+        }
+    }
+
+    let mut hit = None;
+    let mut path = Vec::new();
+    walk(node, area, px, py, tolerance, &mut path, &mut hit);
+    hit
+}

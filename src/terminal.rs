@@ -846,7 +846,9 @@ impl Perform for Performer {
             _ => {}
         }
 
-        if action == 'm' {
+        // `CSI > 4 ; 1 m` (modifyOtherKeys) and other private `m` sequences are
+        // not SGR; parsing them as such used to leave underline stuck on.
+        if action == 'm' && intermediates.is_empty() {
             self.screen.lock().unwrap().apply_sgr(params);
             return;
         }
@@ -1230,6 +1232,21 @@ mod tests {
         assert_eq!(row[1].style, Style::default());
         assert_eq!(row[2].ch, 'Z');
         assert!(row[2].style.reverse);
+    }
+
+    #[test]
+    fn private_keyboard_mode_is_not_parsed_as_sgr() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        for byte in b"\x1b[>4;1mX" {
+            parser.advance(&mut performer, *byte);
+        }
+
+        let screen = performer.screen.lock().unwrap();
+        let row = screen.display_row(0);
+        assert_eq!(row[0].ch, 'X');
+        assert!(!row[0].style.underline);
+        assert!(!row[0].style.bold);
     }
 
     #[test]

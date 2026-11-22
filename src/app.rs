@@ -1,6 +1,7 @@
 use crate::{
     config::{self, Config},
     terminal::Pty,
+    ui::Rect,
 };
 use anyhow::Result;
 
@@ -65,6 +66,16 @@ pub enum SplitDir {
     Vertical,
 }
 
+/// The split whose border is being dragged with Ctrl held.
+#[derive(Clone, Debug)]
+pub struct SplitDrag {
+    /// Path from the root to the split (`false` = first child, `true` = second).
+    pub path: Vec<bool>,
+    pub dir: SplitDir,
+    /// Rectangle the split divides, used to translate the pointer into a ratio.
+    pub area: Rect,
+}
+
 /// Binary tree describing how panes tile the window.
 pub enum LayoutNode {
     Leaf(usize),
@@ -98,6 +109,30 @@ impl LayoutNode {
             LayoutNode::Split { first, second, .. } => {
                 first.split_leaf(target, dir, new_id) || second.split_leaf(target, dir, new_id)
             }
+        }
+    }
+
+    /// Updates the ratio of the split at `path`. Returns whether it was found.
+    pub fn set_ratio(&mut self, path: &[bool], ratio: f32) -> bool {
+        let mut node = self;
+        for &second_child in path {
+            node = match node {
+                LayoutNode::Split { first, second, .. } => {
+                    if second_child {
+                        second.as_mut()
+                    } else {
+                        first.as_mut()
+                    }
+                }
+                LayoutNode::Leaf(_) => return false,
+            };
+        }
+        match node {
+            LayoutNode::Split { ratio: current, .. } => {
+                *current = ratio.clamp(0.1, 0.9);
+                true
+            }
+            LayoutNode::Leaf(_) => false,
         }
     }
 
@@ -210,6 +245,8 @@ pub struct App {
     pub needs_resize: bool,
     /// Pane whose scrollbar thumb is currently being dragged.
     pub scroll_drag: Option<usize>,
+    /// Split border currently being dragged (Ctrl + left mouse button).
+    pub split_drag: Option<SplitDrag>,
     /// Active text selection.
     pub selection: Option<Selection>,
     /// Whether a mouse drag is currently extending the selection.
@@ -230,6 +267,7 @@ impl App {
             running: true,
             needs_resize: false,
             scroll_drag: None,
+            split_drag: None,
             selection: None,
             selecting: false,
             mouse_pressed: None,
@@ -490,6 +528,23 @@ mod tests {
         let mut node = LayoutNode::Leaf(0);
         assert!(node.split_leaf(0, SplitDir::Horizontal, 1));
         assert_eq!(ids(&node), vec![0, 1]);
+    }
+
+    #[test]
+    fn set_ratio_updates_the_split_at_a_path() {
+        let mut node = LayoutNode::Leaf(0);
+        node.split_leaf(0, SplitDir::Horizontal, 1);
+        node.split_leaf(1, SplitDir::Vertical, 2);
+
+        assert!(node.set_ratio(&[true], 0.7));
+        let LayoutNode::Split { second, .. } = &node else {
+            panic!("root should be a split");
+        };
+        let LayoutNode::Split { ratio, .. } = second.as_ref() else {
+            panic!("second child should be a split");
+        };
+        assert!((ratio - 0.7).abs() < f32::EPSILON);
+        assert!(!node.set_ratio(&[true, true], 0.5));
     }
 
     #[test]

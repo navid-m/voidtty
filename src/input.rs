@@ -37,11 +37,11 @@ pub fn handle_event(
     if ctrl_shift {
         match key {
             Key::E => {
-                app.split(SplitDir::Horizontal)?;
+                app.split(SplitDir::Vertical)?;
                 return Ok(true);
             }
             Key::O => {
-                app.split(SplitDir::Vertical)?;
+                app.split(SplitDir::Horizontal)?;
                 return Ok(true);
             }
             Key::T => {
