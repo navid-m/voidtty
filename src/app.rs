@@ -25,7 +25,13 @@ pub struct Pane {
 
 impl Pane {
     fn new(config: &Config, id: usize, accent: usize) -> Result<Self> {
-        let pty = Pty::spawn(&config.shell, 80, 24, config.scrollback)?;
+        let pty = Pty::spawn(
+            &config.shell,
+            80,
+            24,
+            config.scrollback,
+            config.shell_integration_tabs,
+        )?;
         Ok(Self {
             id,
             tabs: vec![Tab { pty, accent }],
@@ -42,7 +48,13 @@ impl Pane {
     }
 
     fn add_tab(&mut self, config: &Config, accent: usize) -> Result<()> {
-        let pty = Pty::spawn(&config.shell, 80, 24, config.scrollback)?;
+        let pty = Pty::spawn(
+            &config.shell,
+            80,
+            24,
+            config.scrollback,
+            config.shell_integration_tabs,
+        )?;
         self.tabs.push(Tab { pty, accent });
         self.active_tab = self.tabs.len() - 1;
         Ok(())

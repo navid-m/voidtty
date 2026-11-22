@@ -4,6 +4,7 @@ mod font;
 mod input;
 mod opener;
 mod renderer;
+mod shell_integration;
 mod terminal;
 mod ui;
 
@@ -1205,7 +1206,14 @@ fn draw_pane(
         renderer.draw_rect(rect.x, rect.y, t, rect.h, c, c, c, 0.6);
     }
 
-    draw_tab_bar(renderer, pane, rect, ui, opacity)?;
+    draw_tab_bar(
+        renderer,
+        pane,
+        rect,
+        ui,
+        opacity,
+        config.shell_integration_tabs,
+    )?;
 
     let content = pane_content(rect, ui.tab_bar_h);
     // Copy the visible grid out while briefly holding the lock; the PTY reader
@@ -1449,6 +1457,64 @@ fn draw_pane(
     Ok(())
 }
 
+const MAX_TAB_TITLE_CHARS: usize = 40;
+
+/// Strips control characters and common `user@host: ` decorations from a title.
+fn clean_tab_title(title: &str) -> String {
+    let title = title.trim();
+    let title = if let Some((_, tail)) = title.split_once(": ") {
+        let tail = tail.trim();
+        if tail.starts_with('/') || tail == "~" || tail.starts_with("~/") {
+            tail
+        } else {
+            title
+        }
+    } else {
+        title
+    };
+    title.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+fn home_relative(path: &str) -> String {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let Some(home) = home else {
+        return path.to_owned();
+    };
+    let home = Path::new(&home);
+    let path = Path::new(path);
+    if path == home {
+        return "~".to_owned();
+    }
+    match path.strip_prefix(home) {
+        Ok(rest) if !rest.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        _ => path.display().to_string(),
+    }
+}
+
+/// Truncates with an ellipsis, preferring to keep the tail of paths.
+fn fit_tab_title(title: &str, max_chars: usize) -> String {
+    let count = title.chars().count();
+    if count <= max_chars {
+        return title.to_owned();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "…".to_owned();
+    }
+    if title.starts_with('~') || title.contains('/') || title.contains('\\') {
+        let mut fitted = String::with_capacity(max_chars);
+        fitted.push('…');
+        fitted.extend(title.chars().skip(count - (max_chars - 1)));
+        fitted
+    } else {
+        let mut fitted: String = title.chars().take(max_chars - 1).collect();
+        fitted.push('…');
+        fitted
+    }
+}
+
 /// Draws one pane's own tab strip along the top of its rectangle.
 fn draw_tab_bar(
     renderer: &mut Renderer,
@@ -1456,6 +1522,7 @@ fn draw_tab_bar(
     rect: Rect,
     ui: UiMetrics,
     opacity: f32,
+    use_cwd: bool,
 ) -> Result<()> {
     let tab_cw = renderer.cell_w();
     let tab_lh = renderer.line_height();
@@ -1464,12 +1531,23 @@ fn draw_tab_bar(
     let mut tab_x = rect.x + ui.tab_bar_pad;
 
     for (i, t) in pane.tabs.iter().enumerate() {
-        if tab_x >= right {
+        if tab_x + tab_cw * 2.0 > right {
             break;
         }
         let active = i == pane.active_tab;
-        let title = t.pty.screen.lock().unwrap().title().to_owned();
-        let title: String = title.chars().take(28).collect();
+        let (title, cwd) = {
+            let screen = t.pty.screen.lock().unwrap();
+            (screen.title().to_owned(), screen.cwd().map(str::to_owned))
+        };
+        let raw_title = if use_cwd {
+            cwd.as_deref()
+                .map(home_relative)
+                .unwrap_or_else(|| clean_tab_title(&title))
+        } else {
+            clean_tab_title(&title)
+        };
+        let available = (((right - tab_x) / tab_cw).floor() as usize).saturating_sub(2);
+        let title = fit_tab_title(&raw_title, available.min(MAX_TAB_TITLE_CHARS));
         let label = format!("{} {}", if active { "●" } else { "○" }, title);
         let cell_count = label.chars().count();
         let width = cell_count as f32 * tab_cw;
@@ -1627,6 +1705,21 @@ mod tests {
         let (target, _, end) = classify(url).unwrap();
         assert_eq!(target, app::LinkTarget::Url(url.into()));
         assert_eq!(end, url.chars().count());
+    }
+
+    #[test]
+    fn tab_titles_strip_user_host_prefixes() {
+        assert_eq!(clean_tab_title("navid@host: ~/projects"), "~/projects");
+        assert_eq!(clean_tab_title("nvim"), "nvim");
+        assert_eq!(clean_tab_title("Cargo.toml"), "Cargo.toml");
+    }
+
+    #[test]
+    fn long_path_titles_keep_their_tail() {
+        let fitted = fit_tab_title("~/Desktop/projects/voidtty", 12);
+        assert_eq!(fitted.chars().count(), 12);
+        assert!(fitted.starts_with('…'));
+        assert!(fitted.ends_with("voidtty"));
     }
 
     #[test]

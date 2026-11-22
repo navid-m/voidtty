@@ -205,6 +205,8 @@ pub struct Screen {
     /// DECSET 1006 SGR mouse coordinate encoding.
     mouse_sgr: bool,
     title: String,
+    /// Working directory reported by the shell via OSC 7.
+    cwd: Option<String>,
     /// OSC 8 hyperlink URIs; index 0 is reserved for "no link".
     links: Vec<String>,
     link_ids: HashMap<String, u32>,
@@ -239,6 +241,7 @@ impl Screen {
             mouse_mode: MouseMode::Off,
             mouse_sgr: false,
             title: "Terminal".to_owned(),
+            cwd: None,
             links: vec![String::new()],
             link_ids: HashMap::new(),
             current_link: 0,
@@ -264,6 +267,11 @@ impl Screen {
         } else {
             title
         };
+    }
+
+    /// Working directory last reported with OSC 7.
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
     }
 
     /// Number of rows in the viewport.
@@ -1155,6 +1163,50 @@ impl Screen {
         self.current_link = 0;
         self.cursor_style = CursorStyle::default();
         self.blink_active = false;
+        self.cwd = None;
+    }
+}
+
+/// Extracts the local path from an OSC 7 `file://host/path` URI.
+fn parse_osc7_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = rest.find('/').map(|index| &rest[index..])?;
+    let decoded = percent_decode(path);
+    if decoded.is_empty() {
+        None
+    } else {
+        Some(decoded)
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    if !input.contains('%') {
+        return input.to_owned();
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push(high * 16 + low);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1249,6 +1301,18 @@ impl Perform for Performer {
                 let title: String = title.chars().take(120).collect();
                 self.screen.lock().unwrap().set_title(title);
             }
+        }
+        // OSC 7 reports the shell's current working directory.
+        if params.first().is_some_and(|param| *param == b"7") {
+            let mut uri = Vec::new();
+            for (index, part) in params.iter().skip(1).enumerate() {
+                if index > 0 {
+                    uri.push(b';');
+                }
+                uri.extend_from_slice(part);
+            }
+            let cwd = std::str::from_utf8(&uri).ok().and_then(parse_osc7_uri);
+            self.screen.lock().unwrap().cwd = cwd;
         }
         // OSC 8 ; params ; URI starts a hyperlink region. An empty URI closes it.
         if params.first().is_some_and(|param| *param == b"8") {
@@ -1439,7 +1503,13 @@ pub struct Pty {
 
 impl Pty {
     /// Spawns `shell` in a PTY sized `cols×rows` and starts a reader thread.
-    pub fn spawn(shell: &str, cols: u16, rows: u16, scrollback_limit: usize) -> Result<Self> {
+    pub fn spawn(
+        shell: &str,
+        cols: u16,
+        rows: u16,
+        scrollback_limit: usize,
+        shell_integration: bool,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -1451,6 +1521,9 @@ impl Pty {
             .context("opening PTY")?;
 
         let mut cmd = CommandBuilder::new(shell);
+        if shell_integration {
+            crate::shell_integration::configure(&mut cmd, shell);
+        }
         cmd.env("TERM", "xterm-256color");
         if let Ok(cwd) = std::env::current_dir() {
             cmd.cwd(cwd);
@@ -1898,6 +1971,19 @@ mod tests {
         }
         let lines = screen.visible_lines();
         assert_eq!(lines, vec!["two".to_owned(), "three".to_owned()]);
+    }
+
+    #[test]
+    fn osc7_reports_the_working_directory() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        feed(
+            &mut parser,
+            &mut performer,
+            b"\x1b]7;file://Resonance/home/navid/My%20Dir\x1b\\",
+        );
+        let screen = performer.screen.lock().unwrap();
+        assert_eq!(screen.cwd(), Some("/home/navid/My Dir"));
     }
 
     #[test]
