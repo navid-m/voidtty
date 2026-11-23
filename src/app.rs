@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::Result;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -24,13 +24,14 @@ pub struct Pane {
 }
 
 impl Pane {
-    fn new(config: &Config, id: usize, accent: usize) -> Result<Self> {
+    fn new(config: &Config, id: usize, accent: usize, cwd: Option<&Path>) -> Result<Self> {
         let pty = Pty::spawn(
             &config.shell,
             80,
             24,
             config.scrollback,
-            config.shell_integration_tabs,
+            config.shell_integration,
+            cwd,
         )?;
         Ok(Self {
             id,
@@ -47,13 +48,14 @@ impl Pane {
         &mut self.tabs[self.active_tab]
     }
 
-    fn add_tab(&mut self, config: &Config, accent: usize) -> Result<()> {
+    fn add_tab(&mut self, config: &Config, accent: usize, cwd: Option<&Path>) -> Result<()> {
         let pty = Pty::spawn(
             &config.shell,
             80,
             24,
             config.scrollback,
-            config.shell_integration_tabs,
+            config.shell_integration,
+            cwd,
         )?;
         self.tabs.push(Tab { pty, accent });
         self.active_tab = self.tabs.len() - 1;
@@ -379,7 +381,7 @@ impl App {
         };
         let id = app.alloc_pane_id();
         let accent = app.alloc_accent();
-        let pane = Pane::new(&app.config, id, accent)?;
+        let pane = Pane::new(&app.config, id, accent, None)?;
         app.focused = id;
         app.panes.push(pane);
         app.layout = Some(LayoutNode::Leaf(id));
@@ -423,12 +425,23 @@ impl App {
         double
     }
 
+    /// Working directory reported by the focused pane, when shell integration
+    /// is enabled and the shell has reported one.
+    fn inherited_cwd(&self) -> Option<PathBuf> {
+        if !self.config.shell_integration {
+            return None;
+        }
+        let screen = self.pane(self.focused)?.active().pty.screen.lock().unwrap();
+        screen.cwd().map(PathBuf::from)
+    }
+
     /// Opens a new tab in the currently focused pane.
     pub fn new_tab(&mut self) -> Result<()> {
         let accent = self.alloc_accent();
         let config = self.config.clone();
+        let cwd = self.inherited_cwd();
         if let Some(pane) = self.pane_mut(self.focused) {
-            pane.add_tab(&config, accent)?;
+            pane.add_tab(&config, accent, cwd.as_deref())?;
         }
         self.selection = None;
         self.needs_resize = true;
@@ -440,7 +453,8 @@ impl App {
         let id = self.alloc_pane_id();
         let accent = self.alloc_accent();
         let config = self.config.clone();
-        let pane = Pane::new(&config, id, accent)?;
+        let cwd = self.inherited_cwd();
+        let pane = Pane::new(&config, id, accent, cwd.as_deref())?;
 
         let target = self.focused;
         self.panes.push(pane);

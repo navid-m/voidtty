@@ -458,7 +458,7 @@ fn process_events(
                             *rect,
                             ui,
                             renderer.cell_w(),
-                            app.config.shell_integration_tabs,
+                            app.config.shell_integration,
                         );
                         if let Some(tab) = tabs
                             .iter()
@@ -1260,14 +1260,7 @@ fn draw_pane(
         renderer.draw_rect(rect.x, rect.y, t, rect.h, c, c, c, 0.6);
     }
 
-    draw_tab_bar(
-        renderer,
-        pane,
-        rect,
-        ui,
-        opacity,
-        config.shell_integration_tabs,
-    )?;
+    draw_tab_bar(renderer, pane, rect, ui, opacity, config.shell_integration)?;
 
     let content = pane_content(rect, ui.tab_bar_h);
     // Copy the visible grid out while briefly holding the lock; the PTY reader

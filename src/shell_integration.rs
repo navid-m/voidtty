@@ -50,6 +50,7 @@ struct Paths {
 }
 
 /// Configures a command so supported shells report their cwd through OSC 7.
+/// Blood emits OSC 7 natively, so it needs no startup snippet.
 pub fn configure(cmd: &mut CommandBuilder, shell: &str) {
     let name = Path::new(shell)
         .file_name()

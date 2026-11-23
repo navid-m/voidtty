@@ -20,8 +20,8 @@ pub struct Config {
     /// Scrollback buffer lines per pane.
     pub scrollback: usize,
     /// Whether shells are started with integration that reports their working
-    /// directory, shown in tab titles.
-    pub shell_integration_tabs: bool,
+    /// directory, used for tab titles and inherited by new panes and tabs.
+    pub shell_integration: bool,
     /// Initial window width in pixels.
     pub win_width: u32,
     /// Initial window height in pixels.
@@ -42,7 +42,7 @@ impl Default for Config {
             font_family: String::new(),
             font_size: 18.0,
             scrollback: 10_000,
-            shell_integration_tabs: false,
+            shell_integration: false,
             win_width: 1280,
             win_height: 800,
             active_pane_thickness: 1.5,
@@ -120,9 +120,9 @@ impl Config {
                         cfg.scrollback = v;
                     }
                 }
-                "shell_integration_tabs" => {
+                "shell_integration" | "shell_integration_tabs" => {
                     if let Some(v) = parse_bool(val) {
-                        cfg.shell_integration_tabs = v;
+                        cfg.shell_integration = v;
                     }
                 }
                 "win_width" => {
@@ -167,9 +167,10 @@ impl Config {
              font_family = {}\n\
              font_size = {:.1}\n\
              scrollback = {}\n\
-             ; Start supported shells with OSC 7 integration and show the\n\
-             ; reported working directory in tab titles.\n\
-             shell_integration_tabs = {}\n\
+             ; Start supported shells with OSC 7 integration. The reported\n\
+             ; working directory is shown in tab titles and inherited by new\n\
+             ; panes and tabs.\n\
+             shell_integration = {}\n\
              win_width = {}\n\
              win_height = {}\n\
              ; Thickness and colour (#RRGGBB) of the focused pane border.\n\
@@ -182,7 +183,7 @@ impl Config {
             self.font_family,
             self.font_size,
             self.scrollback,
-            self.shell_integration_tabs,
+            self.shell_integration,
             self.win_width,
             self.win_height,
             self.active_pane_thickness,
@@ -253,10 +254,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_shell_integration_tabs() {
-        assert!(!Config::default().shell_integration_tabs);
+    fn parses_shell_integration() {
+        assert!(!Config::default().shell_integration);
+        let cfg = Config::parse_ini("shell_integration = true\n");
+        assert!(cfg.shell_integration);
+    }
+
+    #[test]
+    fn accepts_legacy_shell_integration_tabs_key() {
         let cfg = Config::parse_ini("shell_integration_tabs = true\n");
-        assert!(cfg.shell_integration_tabs);
+        assert!(cfg.shell_integration);
     }
 
     #[test]

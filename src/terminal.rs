@@ -3,6 +3,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use std::{
     collections::HashMap,
     io::{ErrorKind, Read, Write},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -1503,12 +1504,15 @@ pub struct Pty {
 
 impl Pty {
     /// Spawns `shell` in a PTY sized `cols×rows` and starts a reader thread.
+    /// A `cwd` reported by another pane is used when it still exists;
+    /// otherwise the shell starts in the emulator's working directory.
     pub fn spawn(
         shell: &str,
         cols: u16,
         rows: u16,
         scrollback_limit: usize,
         shell_integration: bool,
+        cwd: Option<&Path>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -1525,8 +1529,12 @@ impl Pty {
             crate::shell_integration::configure(&mut cmd, shell);
         }
         cmd.env("TERM", "xterm-256color");
-        if let Ok(cwd) = std::env::current_dir() {
-            cmd.cwd(cwd);
+        let start_dir = cwd
+            .filter(|dir| dir.is_dir())
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(start_dir) = start_dir {
+            cmd.cwd(start_dir);
         }
 
         let child = pair.slave.spawn_command(cmd).context("spawning shell")?;
@@ -1984,6 +1992,19 @@ mod tests {
         );
         let screen = performer.screen.lock().unwrap();
         assert_eq!(screen.cwd(), Some("/home/navid/My Dir"));
+    }
+
+    #[test]
+    fn osc7_bel_terminator_reports_the_working_directory() {
+        let (mut performer, _) = performer();
+        let mut parser = Parser::new();
+        feed(
+            &mut parser,
+            &mut performer,
+            b"\x1b]7;file://Resonance/tmp\x07",
+        );
+        let screen = performer.screen.lock().unwrap();
+        assert_eq!(screen.cwd(), Some("/tmp"));
     }
 
     #[test]
