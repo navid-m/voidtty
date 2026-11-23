@@ -1582,6 +1582,52 @@ struct TabLayout {
     hit: Rect,
 }
 
+/// Shares the strip's width among tabs, shrinking each toward its indicator
+/// circle before any tab is dropped. Returns the gap, the first visible tab
+/// and one width in cells per visible tab.
+fn fit_tabs(
+    natural: &[usize],
+    avail_cells: usize,
+    desired_gap: usize,
+    active: usize,
+) -> (usize, usize, Vec<usize>) {
+    let n = natural.len();
+    if n == 0 || avail_cells == 0 {
+        return (0, 0, Vec::new());
+    }
+
+    let mut gap = if n > 1 { desired_gap } else { 0 };
+    if n > 1 && natural.iter().sum::<usize>() + desired_gap * (n - 1) > avail_cells {
+        gap = desired_gap.min(avail_cells.saturating_sub(n) / (n - 1));
+    }
+
+    let visible = avail_cells.min(n);
+    let start = if active + 1 > visible {
+        (active + 1 - visible).min(n - visible)
+    } else {
+        0
+    };
+    let visible_natural = &natural[start..start + visible];
+
+    let budget = avail_cells - gap * (visible - 1);
+    let mut cap = budget / visible;
+    loop {
+        let small: usize = visible_natural.iter().filter(|&&w| w <= cap).sum();
+        let big = visible_natural.iter().filter(|&&w| w > cap).count();
+        if big == 0 {
+            break;
+        }
+        let next = (budget - small) / big;
+        if next <= cap {
+            break;
+        }
+        cap = next;
+    }
+
+    let widths = visible_natural.iter().map(|&w| w.min(cap)).collect();
+    (gap, start, widths)
+}
+
 /// Computes the visible tabs of a pane's tab strip. The same geometry drives
 /// both drawing and click detection.
 fn tab_layout(
@@ -1591,47 +1637,74 @@ fn tab_layout(
     cell_w: f32,
     use_cwd: bool,
 ) -> Vec<TabLayout> {
-    let right = rect.x + rect.w;
-    let mut tab_x = rect.x + ui.tab_bar_pad;
-    let mut tabs = Vec::new();
+    if cell_w <= 0.0 {
+        return Vec::new();
+    }
+    let left = rect.x + ui.tab_bar_pad;
+    let right = rect.x + rect.w - ui.tab_bar_pad;
+    let avail_cells = ((right - left).max(0.0) / cell_w).floor() as usize;
 
-    for (i, t) in pane.tabs.iter().enumerate() {
-        if tab_x + cell_w * 2.0 > right {
-            break;
-        }
-        let active = i == pane.active_tab;
-        let (title, cwd) = {
+    let raw_titles: Vec<String> = pane
+        .tabs
+        .iter()
+        .map(|t| {
             let screen = t.pty.screen.lock().unwrap();
-            (screen.title().to_owned(), screen.cwd().map(str::to_owned))
-        };
-        let raw_title = if use_cwd {
-            cwd.as_deref()
-                .map(home_relative)
-                .unwrap_or_else(|| clean_tab_title(&title))
+            if use_cwd {
+                screen
+                    .cwd()
+                    .map(home_relative)
+                    .unwrap_or_else(|| clean_tab_title(screen.title()))
+            } else {
+                clean_tab_title(screen.title())
+            }
+        })
+        .collect();
+    let natural_cells: Vec<usize> = raw_titles
+        .iter()
+        .map(|title| 2 + title.chars().count().min(MAX_TAB_TITLE_CHARS))
+        .collect();
+    let desired_gap = (ui.tab_gap / cell_w).round() as usize;
+    let (gap_cells, start, widths) =
+        fit_tabs(&natural_cells, avail_cells, desired_gap, pane.active_tab);
+
+    let gap = gap_cells as f32 * cell_w;
+    let half_gap = gap * 0.5;
+    let visible = widths.len();
+    let mut tab_x = left;
+    let mut tabs = Vec::with_capacity(visible);
+    for (offset, cells) in widths.into_iter().enumerate() {
+        let i = start + offset;
+        let active = i == pane.active_tab;
+        let circle = if active { "●" } else { "○" };
+        let label = if cells >= 3 {
+            format!("{} {}", circle, fit_tab_title(&raw_titles[i], cells - 2))
         } else {
-            clean_tab_title(&title)
+            circle.to_owned()
         };
-        let available = (((right - tab_x) / cell_w).floor() as usize).saturating_sub(2);
-        let title = fit_tab_title(&raw_title, available.min(MAX_TAB_TITLE_CHARS));
-        let label = format!("{} {}", if active { "●" } else { "○" }, title);
-        let cell_count = label.chars().count();
-        let width = cell_count as f32 * cell_w;
-        if tab_x + width > right {
-            break;
-        }
+        let width = cells as f32 * cell_w;
         let pad = ui.tab_bar_pad * 0.4;
-        let hit_x = (tab_x - pad).max(rect.x);
-        let hit_w = (tab_x + width + pad).min(right) - hit_x;
+        let slot_left = if offset == 0 {
+            rect.x
+        } else {
+            tab_x - half_gap
+        };
+        let slot_right = if offset + 1 == visible {
+            right
+        } else {
+            tab_x + width + half_gap
+        };
+        let hit_x = (tab_x - pad).max(rect.x).max(slot_left);
+        let hit_w = (tab_x + width + pad).min(right).min(slot_right) - hit_x;
         tabs.push(TabLayout {
             index: i,
             active,
-            accent: t.accent,
+            accent: pane.tabs[i].accent,
             label,
             x: tab_x,
             width,
             hit: Rect::new(hit_x, rect.y, hit_w.max(0.0), ui.tab_bar_h),
         });
-        tab_x += width + ui.tab_gap;
+        tab_x += width + gap;
     }
 
     tabs
@@ -1816,6 +1889,26 @@ mod tests {
         assert_eq!(fitted.chars().count(), 12);
         assert!(fitted.starts_with('…'));
         assert!(fitted.ends_with("voidtty"));
+    }
+
+    #[test]
+    fn tabs_shrink_to_fit_the_strip() {
+        let (gap, start, widths) = fit_tabs(&[20; 10], 20, 2, 0);
+        assert_eq!((gap, start), (1, 0));
+        assert_eq!(widths, vec![1; 10]);
+    }
+
+    #[test]
+    fn short_titles_keep_their_natural_width() {
+        let (_, _, widths) = fit_tabs(&[4, 4, 20], 20, 2, 0);
+        assert_eq!(widths, vec![4, 4, 8]);
+    }
+
+    #[test]
+    fn tab_strip_scrolls_to_keep_the_active_tab_visible() {
+        let (_, start, widths) = fit_tabs(&[5; 10], 4, 2, 7);
+        assert_eq!(start, 4);
+        assert_eq!(widths, vec![1; 4]);
     }
 
     #[test]
