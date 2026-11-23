@@ -889,6 +889,7 @@ dependencies = [
  "fontdue",
  "gl",
  "glfw",
+ "objc2 0.6.5",
  "png",
  "portable-pty",
  "rustybuzz",

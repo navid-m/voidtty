@@ -2,6 +2,8 @@ mod app;
 mod config;
 mod font;
 mod input;
+#[cfg(target_os = "macos")]
+mod macos;
 mod opener;
 mod renderer;
 mod shell_integration;
@@ -59,6 +61,9 @@ fn main() -> Result<()> {
             WindowMode::Windowed,
         )
         .context("creating GLFW window")?;
+
+    #[cfg(target_os = "macos")]
+    macos::install_ctrl_tab_handler(window.get_cocoa_window());
 
     let content_scale = window.get_content_scale();
     let mut ui = UiMetrics::new(content_scale.0.max(content_scale.1));
@@ -189,6 +194,15 @@ fn process_events(
     clipboard: &mut Option<arboard::Clipboard>,
 ) -> Result<bool> {
     let mut redraw = false;
+    #[cfg(target_os = "macos")]
+    if let Some(step) = macos::take_pending_tab_step() {
+        if step > 0 {
+            app.next_tab();
+        } else {
+            app.prev_tab();
+        }
+        redraw = true;
+    }
     for (_, event) in glfw::flush_messages(events) {
         match event {
             WindowEvent::Focus(false) => {
@@ -425,6 +439,46 @@ fn process_events(
                     app.hover_link = None;
                     redraw = true;
                     continue;
+                }
+
+                // Left click on a pane's tab strip switches that pane's tab.
+                if button == glfw::MouseButton::Button1 {
+                    let mut clicked_tab = false;
+                    for (id, rect) in &rects {
+                        if mx < rect.x
+                            || mx >= rect.x + rect.w
+                            || my < rect.y
+                            || my >= rect.y + ui.tab_bar_h
+                        {
+                            continue;
+                        }
+                        let Some(pane) = app.pane(*id) else { continue };
+                        let tabs = tab_layout(
+                            pane,
+                            *rect,
+                            ui,
+                            renderer.cell_w(),
+                            app.config.shell_integration_tabs,
+                        );
+                        if let Some(tab) = tabs
+                            .iter()
+                            .find(|tab| mx >= tab.hit.x && mx < tab.hit.x + tab.hit.w)
+                        {
+                            app.focused = *id;
+                            if let Some(pane) = app.pane_mut(*id) {
+                                pane.active_tab = tab.index;
+                            }
+                            app.selection = None;
+                            app.selecting = false;
+                            app.mouse_pressed = None;
+                            redraw = true;
+                            clicked_tab = true;
+                            break;
+                        }
+                    }
+                    if clicked_tab {
+                        continue;
+                    }
                 }
 
                 let mut grabbed_scrollbar = false;
@@ -1515,23 +1569,34 @@ fn fit_tab_title(title: &str, max_chars: usize) -> String {
     }
 }
 
-/// Draws one pane's own tab strip along the top of its rectangle.
-fn draw_tab_bar(
-    renderer: &mut Renderer,
+/// Screen geometry and label for one visible tab in a pane's tab strip.
+struct TabLayout {
+    index: usize,
+    active: bool,
+    accent: usize,
+    label: String,
+    x: f32,
+    width: f32,
+    /// Clickable area, slightly wider than the label to match the active tab's
+    /// background and make small tabs easier to hit.
+    hit: Rect,
+}
+
+/// Computes the visible tabs of a pane's tab strip. The same geometry drives
+/// both drawing and click detection.
+fn tab_layout(
     pane: &app::Pane,
     rect: Rect,
     ui: UiMetrics,
-    opacity: f32,
+    cell_w: f32,
     use_cwd: bool,
-) -> Result<()> {
-    let tab_cw = renderer.cell_w();
-    let tab_lh = renderer.line_height();
-    let tab_text_y = rect.y + (ui.tab_bar_h - tab_lh) * 0.5;
+) -> Vec<TabLayout> {
     let right = rect.x + rect.w;
     let mut tab_x = rect.x + ui.tab_bar_pad;
+    let mut tabs = Vec::new();
 
     for (i, t) in pane.tabs.iter().enumerate() {
-        if tab_x + tab_cw * 2.0 > right {
+        if tab_x + cell_w * 2.0 > right {
             break;
         }
         let active = i == pane.active_tab;
@@ -1546,22 +1611,54 @@ fn draw_tab_bar(
         } else {
             clean_tab_title(&title)
         };
-        let available = (((right - tab_x) / tab_cw).floor() as usize).saturating_sub(2);
+        let available = (((right - tab_x) / cell_w).floor() as usize).saturating_sub(2);
         let title = fit_tab_title(&raw_title, available.min(MAX_TAB_TITLE_CHARS));
         let label = format!("{} {}", if active { "●" } else { "○" }, title);
         let cell_count = label.chars().count();
-        let width = cell_count as f32 * tab_cw;
+        let width = cell_count as f32 * cell_w;
         if tab_x + width > right {
             break;
         }
-        let (r, g, b) = tab_color(t.accent, active);
+        let pad = ui.tab_bar_pad * 0.4;
+        let hit_x = (tab_x - pad).max(rect.x);
+        let hit_w = (tab_x + width + pad).min(right) - hit_x;
+        tabs.push(TabLayout {
+            index: i,
+            active,
+            accent: t.accent,
+            label,
+            x: tab_x,
+            width,
+            hit: Rect::new(hit_x, rect.y, hit_w.max(0.0), ui.tab_bar_h),
+        });
+        tab_x += width + ui.tab_gap;
+    }
 
-        if active {
+    tabs
+}
+
+/// Draws one pane's own tab strip along the top of its rectangle.
+fn draw_tab_bar(
+    renderer: &mut Renderer,
+    pane: &app::Pane,
+    rect: Rect,
+    ui: UiMetrics,
+    opacity: f32,
+    use_cwd: bool,
+) -> Result<()> {
+    let tab_lh = renderer.line_height();
+    let tab_text_y = rect.y + (ui.tab_bar_h - tab_lh) * 0.5;
+    let tabs = tab_layout(pane, rect, ui, renderer.cell_w(), use_cwd);
+
+    for t in tabs {
+        let (r, g, b) = tab_color(t.accent, t.active);
+
+        if t.active {
             let bg = ui.tab_bar_pad * 0.4;
             renderer.draw_round_rect(
-                tab_x - bg,
+                t.x - bg,
                 rect.y,
-                width + bg * 2.0,
+                t.width + bg * 2.0,
                 ui.tab_bar_h,
                 4.0 * ui.scale,
                 r * 0.5,
@@ -1570,9 +1667,9 @@ fn draw_tab_bar(
                 0.12 * opacity,
             );
             renderer.draw_rect(
-                tab_x,
+                t.x,
                 rect.y + ui.tab_bar_h - ui.scale,
-                width,
+                t.width,
                 ui.scale,
                 r,
                 g,
@@ -1581,9 +1678,10 @@ fn draw_tab_bar(
             );
         }
 
+        let cell_count = t.label.chars().count();
         let mut colors = Vec::with_capacity(cell_count);
         colors.push((r, g, b));
-        let fg = if active {
+        let fg = if t.active {
             (0.92, 0.92, 0.95)
         } else {
             (0.55, 0.55, 0.60)
@@ -1592,16 +1690,14 @@ fn draw_tab_bar(
             colors.push(fg);
         }
         renderer.draw_text_styled(
-            &label,
+            &t.label,
             &colors,
             None,
             None,
-            tab_x,
+            t.x,
             tab_text_y,
-            if active { 1.0 } else { 0.85 },
+            if t.active { 1.0 } else { 0.85 },
         )?;
-
-        tab_x += width + ui.tab_gap;
     }
 
     Ok(())

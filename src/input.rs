@@ -36,6 +36,23 @@ pub fn handle_event(
 
     let ctrl_shift = mods.contains(Modifiers::Control | Modifiers::Shift);
     let ctrl = mods.contains(Modifiers::Control) && !mods.contains(Modifiers::Shift);
+    let super_shift = mods.contains(Modifiers::Super | Modifiers::Shift);
+
+    // macOS consumes Ctrl+Tab before it reaches the window, so also accept the
+    // standard Mac equivalents Cmd+Shift+[ and Cmd+Shift+].
+    if super_shift {
+        match key {
+            Key::LeftBracket => {
+                app.prev_tab();
+                return Ok(true);
+            }
+            Key::RightBracket => {
+                app.next_tab();
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
 
     // Ctrl + / Ctrl - (and numpad equivalents) zoom the text size.
     if ctrl || ctrl_shift {
@@ -106,6 +123,14 @@ pub fn handle_event(
                 app.prev_tab();
                 return Ok(true);
             }
+            Key::PageUp => {
+                app.prev_tab();
+                return Ok(true);
+            }
+            Key::PageDown => {
+                app.next_tab();
+                return Ok(true);
+            }
             Key::C => {
                 if let Some(text) = app.copy_selection()
                     && let Some(clipboard) = clipboard.as_mut()
@@ -130,9 +155,18 @@ pub fn handle_event(
         }
     }
 
-    if ctrl && key == Key::Tab {
-        app.next_tab();
-        return Ok(true);
+    if ctrl {
+        match key {
+            Key::Tab | Key::PageDown => {
+                app.next_tab();
+                return Ok(true);
+            }
+            Key::PageUp => {
+                app.prev_tab();
+                return Ok(true);
+            }
+            _ => {}
+        }
     }
 
     let bytes: Vec<u8> = if ctrl {
