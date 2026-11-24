@@ -554,6 +554,13 @@ fn process_events(
                                 app.selecting = false;
                             }
                             if !reported && button == glfw::MouseButton::Button1 {
+                                // Shift-click extends the existing selection to the
+                                // clicked cell, keeping its original anchor.
+                                let previous = if mods.contains(glfw::Modifiers::Shift) {
+                                    app.selection.filter(|s| s.pane == id)
+                                } else {
+                                    None
+                                };
                                 app.selection = None;
                                 app.selecting = false;
                                 if let Some(rect) = rects
@@ -578,20 +585,26 @@ fn process_events(
                                             my,
                                         )
                                     {
-                                        let cols = pane.active().pty.screen.lock().unwrap().cols();
-                                        let double = app.register_click(id, cell.0);
-                                        if double {
-                                            app.selection = Some(app::Selection {
-                                                pane: id,
-                                                anchor: (cell.0, 0),
-                                                cursor: (cell.0, cols.saturating_sub(1)),
-                                            });
+                                        if let Some(mut selection) = previous {
+                                            selection.cursor = cell;
+                                            app.selection = Some(selection);
                                         } else {
-                                            app.selection = Some(app::Selection {
-                                                pane: id,
-                                                anchor: cell,
-                                                cursor: cell,
-                                            });
+                                            let cols =
+                                                pane.active().pty.screen.lock().unwrap().cols();
+                                            let double = app.register_click(id, cell.0);
+                                            if double {
+                                                app.selection = Some(app::Selection {
+                                                    pane: id,
+                                                    anchor: (cell.0, 0),
+                                                    cursor: (cell.0, cols.saturating_sub(1)),
+                                                });
+                                            } else {
+                                                app.selection = Some(app::Selection {
+                                                    pane: id,
+                                                    anchor: cell,
+                                                    cursor: cell,
+                                                });
+                                            }
                                         }
                                         app.selecting = true;
                                     }
