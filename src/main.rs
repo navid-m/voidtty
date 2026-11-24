@@ -18,7 +18,7 @@ use glfw::{
 use std::{
     env,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use app::{App, SplitDir};
@@ -110,6 +110,7 @@ fn main() -> Result<()> {
 
     let blink_epoch = Instant::now();
     let mut last_blink_phase = true;
+    let mut last_notification_frame = Instant::now();
     let mut redraw = true;
     let mut was_iconified = window.is_iconified();
     while !window.should_close() && app.running {
@@ -166,6 +167,17 @@ fn main() -> Result<()> {
         }
 
         redraw = events_changed || output_changed || layout_changed || restored;
+
+        // Animate the copy confirmation at roughly 60 fps, then repaint once
+        // more after it expires so it is cleared from the window.
+        if app.copy_notification_opacity().is_some() {
+            if last_notification_frame.elapsed() >= Duration::from_millis(16) {
+                last_notification_frame = Instant::now();
+                redraw = true;
+            }
+        } else if app.expire_copy_notification() {
+            redraw = true;
+        }
 
         let blink_on = (blink_epoch.elapsed().as_millis() / 500).is_multiple_of(2);
         if blink_on != last_blink_phase {
@@ -1283,6 +1295,40 @@ fn draw_search(renderer: &mut Renderer, app: &App, ui: UiMetrics, opacity: f32) 
     Ok(())
 }
 
+/// Draws the short-lived confirmation shown after a selection is copied.
+fn draw_copy_notification(
+    renderer: &mut Renderer,
+    app: &App,
+    ui: UiMetrics,
+    opacity: f32,
+) -> Result<()> {
+    let Some(fade) = app.copy_notification_opacity() else {
+        return Ok(());
+    };
+    let text = "Copied text";
+    let chars = text.chars().count();
+    let cw = renderer.cell_w();
+    let lh = renderer.line_height();
+    let pad_x = 14.0 * ui.scale;
+    let pad_y = 8.0 * ui.scale;
+    let w = chars as f32 * cw + pad_x * 2.0;
+    let h = lh + pad_y * 2.0;
+    let x = (renderer.win_w - w) * 0.5;
+    let y = renderer.win_h - h - 24.0 * ui.scale;
+    let alpha = opacity * fade;
+    renderer.draw_round_rect(x, y, w, h, 6.0 * ui.scale, 0.07, 0.09, 0.13, 0.94 * alpha);
+    renderer.draw_rect(x, y, 2.0 * ui.scale, h, 0.30, 0.65, 1.0, 0.85 * alpha);
+    draw_plain_line(
+        renderer,
+        text,
+        x + pad_x,
+        y + pad_y,
+        chars,
+        (0.92, 0.95, 1.0),
+        alpha,
+    )
+}
+
 fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics, blink_on: bool) -> Result<()> {
     let opacity = app.config.opacity;
     // Black background respecting transparency.
@@ -1311,6 +1357,7 @@ fn draw_frame(renderer: &mut Renderer, app: &App, ui: UiMetrics, blink_on: bool)
     }
 
     draw_search(renderer, app, ui, opacity)?;
+    draw_copy_notification(renderer, app, ui, opacity)?;
 
     renderer.flush();
     Ok(())

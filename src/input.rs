@@ -132,10 +132,13 @@ pub fn handle_event(
                 return Ok(true);
             }
             Key::C => {
-                if let Some(text) = app.copy_selection()
-                    && let Some(clipboard) = clipboard.as_mut()
-                {
-                    let _ = clipboard.set_text(text);
+                if let Some(text) = app.copy_selection() {
+                    let copied = clipboard
+                        .as_mut()
+                        .is_some_and(|clipboard| clipboard.set_text(text).is_ok());
+                    if copied {
+                        app.notify_copied();
+                    }
                 }
                 return Ok(true);
             }

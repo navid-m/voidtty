@@ -32,6 +32,8 @@ pub struct Config {
     pub active_pane_colour: (f32, f32, f32),
     /// Whether typing in a scrolled-up pane jumps back to the live screen.
     pub active_keypress_snap: bool,
+    /// Whether to show a brief confirmation after copying a selection.
+    pub show_copy_notification: bool,
 }
 
 impl Default for Config {
@@ -48,6 +50,7 @@ impl Default for Config {
             active_pane_thickness: 1.5,
             active_pane_colour: (0.3, 0.7, 1.0),
             active_keypress_snap: true,
+            show_copy_notification: true,
         }
     }
 }
@@ -150,6 +153,11 @@ impl Config {
                         cfg.active_keypress_snap = v;
                     }
                 }
+                "show_copy_notification" => {
+                    if let Some(v) = parse_bool(val) {
+                        cfg.show_copy_notification = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -177,7 +185,9 @@ impl Config {
              active_pane_thickness = {:.1}\n\
              active_pane_colour = {}\n\
              ; Jump back to the live screen when typing while scrolled up.\n\
-             active_keypress_snap = {}\n",
+             active_keypress_snap = {}\n\
+             ; Show a brief confirmation after copying a selection.\n\
+             show_copy_notification = {}\n",
             self.opacity,
             self.shell,
             self.font_family,
@@ -189,6 +199,7 @@ impl Config {
             self.active_pane_thickness,
             colour_hex(self.active_pane_colour),
             self.active_keypress_snap,
+            self.show_copy_notification,
         )
     }
 }
@@ -251,6 +262,14 @@ mod tests {
         assert!((g - 136.0 / 255.0).abs() < 0.01);
         assert!(b.abs() < 0.01);
         assert!(!cfg.active_keypress_snap);
+    }
+
+    #[test]
+    fn copy_notification_defaults_on_and_can_be_disabled() {
+        assert!(Config::default().show_copy_notification);
+        let cfg = Config::parse_ini("show_copy_notification = false\n");
+        assert!(!cfg.show_copy_notification);
+        assert!(cfg.to_ini().contains("show_copy_notification = false"));
     }
 
     #[test]

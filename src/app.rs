@@ -305,6 +305,10 @@ pub struct SearchState {
 
 const SEARCH_RESULT_LIMIT: usize = 100;
 
+const COPY_NOTIFICATION_DURATION: Duration = Duration::from_millis(1500);
+const COPY_NOTIFICATION_FADE_IN: f32 = 0.12;
+const COPY_NOTIFICATION_FADE_OUT: f32 = 0.35;
+
 /// Details of the last mouse press, used to detect double-clicks.
 struct LastClick {
     pane: usize,
@@ -354,6 +358,8 @@ pub struct App {
     pub hover_link: Option<HoverLink>,
     /// Cross-pane history search overlay, when open.
     pub search: Option<SearchState>,
+    /// When the "Copied text" confirmation was shown.
+    copy_notification_at: Option<Instant>,
     last_click: Option<LastClick>,
     next_pane_id: usize,
     next_accent: usize,
@@ -376,6 +382,7 @@ impl App {
             ctrl_down: false,
             hover_link: None,
             search: None,
+            copy_notification_at: None,
             last_click: None,
             next_pane_id: 0,
             next_accent: 0,
@@ -731,6 +738,45 @@ impl App {
         let (start, end) = selection.range();
         let screen = pane.active().pty.screen.lock().unwrap();
         Some(screen.text_between(start, end))
+    }
+
+    /// Shows the copy confirmation when enabled in settings.
+    pub fn notify_copied(&mut self) {
+        if self.config.show_copy_notification {
+            self.copy_notification_at = Some(Instant::now());
+        }
+    }
+
+    /// Fade alpha for the copy confirmation, or `None` when it is hidden.
+    pub fn copy_notification_opacity(&self) -> Option<f32> {
+        let at = self.copy_notification_at?;
+        let total = COPY_NOTIFICATION_DURATION.as_secs_f32();
+        let elapsed = at.elapsed().as_secs_f32();
+        if elapsed >= total {
+            return None;
+        }
+        let alpha = if elapsed < COPY_NOTIFICATION_FADE_IN {
+            elapsed / COPY_NOTIFICATION_FADE_IN
+        } else if elapsed > total - COPY_NOTIFICATION_FADE_OUT {
+            (total - elapsed) / COPY_NOTIFICATION_FADE_OUT
+        } else {
+            1.0
+        };
+        Some(alpha.clamp(0.0, 1.0))
+    }
+
+    /// Clears the copy confirmation after its lifetime. Returns whether it was
+    /// cleared, so the window can repaint without it.
+    pub fn expire_copy_notification(&mut self) -> bool {
+        if self
+            .copy_notification_at
+            .is_some_and(|at| at.elapsed() >= COPY_NOTIFICATION_DURATION)
+        {
+            self.copy_notification_at = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Sends pasted text to the focused terminal, respecting bracketed paste.
