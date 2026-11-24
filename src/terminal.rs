@@ -380,19 +380,31 @@ impl Screen {
         self.scroll_offset = offset.min(self.scrollback.len());
     }
 
+    /// Absolute history index of the first displayed row.
+    pub fn view_top(&self) -> usize {
+        self.scrollback.len().saturating_sub(self.scroll_offset())
+    }
+
     /// Returns a row as currently displayed (history when scrolled up).
     pub fn display_row(&self, row: usize) -> &[Cell] {
-        let total = self.scrollback.len() + self.rows;
-        let top = total
-            .saturating_sub(self.rows + self.scroll_offset())
-            .min(self.scrollback.len());
-        let index = top + row;
+        let index = self.view_top() + row;
         let cells = if index < self.scrollback.len() {
             &self.scrollback[index][..]
         } else {
             &self.grid[(index - self.scrollback.len()).min(self.rows - 1)][..]
         };
         &cells[..cells.len().min(self.cols)]
+    }
+
+    /// Returns a row by absolute history index, independent of the current
+    /// scroll position.
+    fn history_row(&self, index: usize) -> Option<&[Cell]> {
+        let cells = if index < self.scrollback.len() {
+            &self.scrollback[index][..]
+        } else {
+            self.grid.get(index - self.scrollback.len())?.as_slice()
+        };
+        Some(&cells[..cells.len().min(self.cols)])
     }
 
     /// Iterates over the rows currently visible in the viewport.
@@ -466,17 +478,21 @@ impl Screen {
         }
     }
 
-    /// Extracts text between two display cells (inclusive), one line per row.
+    /// Extracts text between two absolute history cells (inclusive), one line
+    /// per row. Unlike display coordinates these stay valid while scrolling.
     pub fn text_between(&self, start: (usize, usize), end: (usize, usize)) -> String {
         let (start, end) = if start <= end {
             (start, end)
         } else {
             (end, start)
         };
-        let last_row = end.0.min(self.rows.saturating_sub(1));
+        let last_row = end.0.min(self.history_line_count().saturating_sub(1));
         let mut lines: Vec<String> = Vec::new();
         for row in start.0.min(last_row)..=last_row {
-            let cells = self.display_row(row);
+            let Some(cells) = self.history_row(row) else {
+                lines.push(String::new());
+                continue;
+            };
             if cells.is_empty() {
                 lines.push(String::new());
                 continue;
@@ -2118,5 +2134,29 @@ mod tests {
         screen.set_scroll_offset(5);
         assert_eq!(row_string(screen.display_row(0)), "H5");
         assert_eq!(row_string(screen.display_row(1)), "H6");
+    }
+
+    #[test]
+    fn view_top_tracks_the_scroll_position() {
+        let mut screen = Screen::new(10, 2, 100);
+        for i in 0..5 {
+            screen.push_scrollback(styled_row(&format!("H{i}")));
+        }
+        assert_eq!(screen.view_top(), 5);
+        screen.set_scroll_offset(1);
+        assert_eq!(screen.view_top(), 4);
+        screen.set_scroll_offset(99);
+        assert_eq!(screen.view_top(), 0);
+    }
+
+    #[test]
+    fn selection_text_uses_absolute_history_rows() {
+        let mut screen = Screen::new(4, 2, 10);
+        for i in 0..4 {
+            screen.push_scrollback(styled_row(&format!("H{i}")));
+        }
+        assert_eq!(screen.text_between((0, 0), (1, 1)), "H0\nH1");
+        screen.set_scroll_offset(2);
+        assert_eq!(screen.text_between((0, 0), (1, 1)), "H0\nH1");
     }
 }

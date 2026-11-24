@@ -11,7 +11,10 @@ mod terminal;
 mod ui;
 
 use anyhow::{Context, Result};
-use glfw::{Context as _, GlfwReceiver, OpenGlProfileHint, WindowEvent, WindowHint, WindowMode};
+use glfw::{
+    Action, Context as _, GlfwReceiver, Key, Modifiers, OpenGlProfileHint, WindowEvent, WindowHint,
+    WindowMode,
+};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -249,15 +252,18 @@ fn process_events(
                     reported =
                         send_mouse_report(app, id, *rect, renderer, ui, code, false, mx, my)?;
                 }
+                let mut scrolled = false;
                 if !reported && let Some(pane) = app.pane_mut(id) {
-                    pane.active_mut()
-                        .pty
-                        .screen
-                        .lock()
-                        .unwrap()
-                        .scroll_by_lines(y as f32);
+                    let mut screen = pane.active_mut().pty.screen.lock().unwrap();
+                    let before = screen.scroll_offset();
+                    screen.scroll_by_lines(y as f32);
+                    scrolled = screen.scroll_offset() != before;
                 }
-                app.selection = None;
+                // Keep dragging selections alive while the view scrolls, and
+                // move their endpoint to the cell now under the pointer.
+                if scrolled && app.selecting && app.selection.is_some_and(|s| s.pane == id) {
+                    extend_selection_to_pointer(app, renderer, ui, mx, my);
+                }
                 redraw = true;
                 redraw |= update_hover_link(app, renderer, ui, mx, my);
             }
@@ -278,27 +284,14 @@ fn process_events(
                         app.needs_resize = true;
                         redraw = true;
                     }
-                } else if app.selecting
-                    && let Some(mut selection) = app.selection
-                {
-                    let rects = pane_layout(app, renderer);
-                    if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == selection.pane)
-                        && let Some(pane) = app.pane(selection.pane)
-                        && let Some(cell) = cell_at(
-                            pane,
-                            *rect,
-                            ui,
-                            renderer.cell_w(),
-                            renderer.line_height(),
-                            x as f32 * ui.scale,
-                            y as f32 * ui.scale,
-                        )
-                        && cell != selection.cursor
-                    {
-                        selection.cursor = cell;
-                        app.selection = Some(selection);
-                        redraw = true;
-                    }
+                } else if app.selecting {
+                    redraw |= extend_selection_to_pointer(
+                        app,
+                        renderer,
+                        ui,
+                        x as f32 * ui.scale,
+                        y as f32 * ui.scale,
+                    );
                 } else if let Some(id) = app.scroll_drag {
                     let rects = pane_layout(app, renderer);
                     if let Some((_, rect)) = rects.iter().find(|(pane_id, _)| *pane_id == id) {
@@ -563,7 +556,7 @@ fn process_events(
                                         && my >= content.y
                                         && my < content.y + content.h;
                                     if inside
-                                        && let Some(cell) = cell_at(
+                                        && let Some(cell) = history_cell_at(
                                             pane,
                                             rect,
                                             ui,
@@ -599,6 +592,49 @@ fn process_events(
                         }
                     }
                 }
+            }
+            WindowEvent::Key(key, _, Action::Press | Action::Repeat, mods)
+                if matches!(key, Key::PageUp | Key::PageDown)
+                    && !mods.contains(Modifiers::Control)
+                    && app.search.is_none()
+                    && (app.selecting || mods.contains(Modifiers::Shift)) =>
+            {
+                let (mx, my) = window.get_cursor_pos();
+                let mx = mx as f32 * ui.scale;
+                let my = my as f32 * ui.scale;
+                let rects = pane_layout(app, renderer);
+                let id = if app.selecting {
+                    app.selection
+                        .map(|selection| selection.pane)
+                        .unwrap_or(app.focused)
+                } else {
+                    ui::hit_pane(mx, my, &rects).unwrap_or(app.focused)
+                };
+                let page = app
+                    .pane(id)
+                    .map(|pane| {
+                        pane.active()
+                            .pty
+                            .screen
+                            .lock()
+                            .unwrap()
+                            .rows()
+                            .saturating_sub(1)
+                            .max(1) as isize
+                    })
+                    .unwrap_or(1);
+                let mut scrolled = false;
+                if let Some(pane) = app.pane_mut(id) {
+                    let mut screen = pane.active().pty.screen.lock().unwrap();
+                    let before = screen.scroll_offset();
+                    let lines = if key == Key::PageUp { page } else { -page };
+                    screen.scroll_by(lines);
+                    scrolled = screen.scroll_offset() != before;
+                }
+                if scrolled && app.selecting && app.selection.is_some_and(|s| s.pane == id) {
+                    redraw |= extend_selection_to_pointer(app, renderer, ui, mx, my);
+                }
+                redraw |= scrolled;
             }
             ev => {
                 let ctrl_before = app.ctrl_down;
@@ -653,6 +689,59 @@ fn cell_at(
         row.clamp(0.0, (rows - 1) as f32) as usize,
         col.clamp(0.0, (cols - 1) as f32) as usize,
     ))
+}
+
+/// Maps a window position to an absolute history cell, which stays meaningful
+/// when the pane is scrolled.
+fn history_cell_at(
+    pane: &app::Pane,
+    rect: Rect,
+    ui: UiMetrics,
+    cell_w: f32,
+    line_h: f32,
+    mx: f32,
+    my: f32,
+) -> Option<(usize, usize)> {
+    let (row, col) = cell_at(pane, rect, ui, cell_w, line_h, mx, my)?;
+    let top = pane.active().pty.screen.lock().unwrap().view_top();
+    Some((top + row, col))
+}
+
+/// Extends the active selection to the history cell under the pointer.
+fn extend_selection_to_pointer(
+    app: &mut App,
+    renderer: &Renderer,
+    ui: UiMetrics,
+    mx: f32,
+    my: f32,
+) -> bool {
+    let Some(mut selection) = app.selection else {
+        return false;
+    };
+    let rects = pane_layout(app, renderer);
+    let Some((_, rect)) = rects.iter().find(|(id, _)| *id == selection.pane) else {
+        return false;
+    };
+    let Some(pane) = app.pane(selection.pane) else {
+        return false;
+    };
+    let Some(cell) = history_cell_at(
+        pane,
+        *rect,
+        ui,
+        renderer.cell_w(),
+        renderer.line_height(),
+        mx,
+        my,
+    ) else {
+        return false;
+    };
+    if cell == selection.cursor {
+        return false;
+    }
+    selection.cursor = cell;
+    app.selection = Some(selection);
+    true
 }
 
 /// Updates the hovered link for the current pointer position. Returns whether
@@ -1272,6 +1361,7 @@ fn draw_pane(
         scroll_offset,
         max_scroll,
         row_count,
+        view_top,
     ) = {
         let screen = pane.active().pty.screen.lock().unwrap();
         screen.copy_visible(rows);
@@ -1282,6 +1372,7 @@ fn draw_pane(
             screen.scroll_offset(),
             screen.max_scroll(),
             screen.rows(),
+            screen.view_top(),
         )
     };
     let cw = renderer.cell_w();
@@ -1296,6 +1387,7 @@ fn draw_pane(
 
     for (row, cells) in rows.iter().enumerate() {
         let y = content.y + ui.pane_pad + row as f32 * lh;
+        let history_row = view_top + row;
         let cursor_here = show_cursor && row == cursor_row;
         let cursor_cell = (cursor_here && cursor_style.shape == CursorShape::Block)
             .then(|| cursor_col.min(cells.len().saturating_sub(1)));
@@ -1311,8 +1403,12 @@ fn draw_pane(
         // Extend the row to cover a selection even across blank cells.
         if let Some(selection) = selection {
             let (start, end) = selection.range();
-            if row >= start.0 && row <= end.0 {
-                let end_col = if row == end.0 { end.1 + 1 } else { cells.len() };
+            if history_row >= start.0 && history_row <= end.0 {
+                let end_col = if history_row == end.0 {
+                    end.1 + 1
+                } else {
+                    cells.len()
+                };
                 last = last.max(end_col.min(cells.len()));
             }
         }
@@ -1353,7 +1449,7 @@ fn draw_pane(
             } else {
                 cell.style
             };
-            let selected = selection.is_some_and(|selection| selection.contains(row, col));
+            let selected = selection.is_some_and(|selection| selection.contains(history_row, col));
             let (fg, bg, fill) = if selected {
                 (SELECTION_FG, SELECTION_BG, true)
             } else {

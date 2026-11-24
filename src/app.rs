@@ -259,7 +259,8 @@ fn remove_leaf(node: LayoutNode, target: usize) -> (Option<LayoutNode>, bool) {
     }
 }
 
-/// A text selection within one pane, stored in display-grid coordinates.
+/// A text selection within one pane, stored in absolute history coordinates
+/// (scrollback plus the live grid) so it survives scrolling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
     pub pane: usize,
