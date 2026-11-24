@@ -203,7 +203,7 @@ pub fn handle_event(
             Key::LeftBracket => vec![0x1b],
             Key::Backslash => vec![0x1c],
             Key::RightBracket => vec![0x1d],
-            _ => vec![],
+            _ => key_to_bytes(key, mods),
         }
     } else {
         key_to_bytes(key, mods)
@@ -242,17 +242,32 @@ fn key_to_bytes(key: Key, mods: Modifiers) -> Vec<u8> {
     if key == Key::Tab && mods.contains(Modifiers::Shift) {
         return b"\x1b[Z".to_vec();
     }
+    let shift = mods.contains(Modifiers::Shift);
+    let alt = mods.contains(Modifiers::Alt);
+    // xterm encodes modifiers as 1 + shift + 2*alt + 4*ctrl.
+    let modifier =
+        1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(mods.contains(Modifiers::Control));
+    let nav = |final_byte: u8| {
+        if modifier > 1 {
+            format!("\x1b[1;{}{}", modifier, final_byte as char).into_bytes()
+        } else {
+            vec![0x1b, b'[', final_byte]
+        }
+    };
     match key {
         Key::Enter => b"\r".to_vec(),
+        // Meta-backspace deletes a word in shells that follow the ESC prefix
+        // convention (blood, readline in meta mode).
+        Key::Backspace if alt => b"\x1b\x7f".to_vec(),
         Key::Backspace => vec![0x7f],
         Key::Tab => b"\t".to_vec(),
         Key::Escape => vec![0x1b],
-        Key::Up => b"\x1b[A".to_vec(),
-        Key::Down => b"\x1b[B".to_vec(),
-        Key::Right => b"\x1b[C".to_vec(),
-        Key::Left => b"\x1b[D".to_vec(),
-        Key::Home => b"\x1b[H".to_vec(),
-        Key::End => b"\x1b[F".to_vec(),
+        Key::Up => nav(b'A'),
+        Key::Down => nav(b'B'),
+        Key::Right => nav(b'C'),
+        Key::Left => nav(b'D'),
+        Key::Home => nav(b'H'),
+        Key::End => nav(b'F'),
         Key::PageUp => b"\x1b[5~".to_vec(),
         Key::PageDown => b"\x1b[6~".to_vec(),
         Key::Delete => b"\x1b[3~".to_vec(),
@@ -271,5 +286,35 @@ fn key_to_bytes(key: Key, mods: Modifiers) -> Vec<u8> {
         Key::F12 => b"\x1b[24~".to_vec(),
         // Printable keys not handled via char callback (e.g. when num-lock is off).
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alt_keys_use_xterm_modifier_sequences() {
+        assert_eq!(
+            key_to_bytes(Key::Left, Modifiers::Alt),
+            b"\x1b[1;3D".to_vec()
+        );
+        assert_eq!(
+            key_to_bytes(Key::Right, Modifiers::Alt),
+            b"\x1b[1;3C".to_vec()
+        );
+        assert_eq!(
+            key_to_bytes(Key::Backspace, Modifiers::Alt),
+            b"\x1b\x7f".to_vec()
+        );
+    }
+
+    #[test]
+    fn unmodified_keys_keep_plain_sequences() {
+        assert_eq!(
+            key_to_bytes(Key::Left, Modifiers::empty()),
+            b"\x1b[D".to_vec()
+        );
+        assert_eq!(key_to_bytes(Key::Backspace, Modifiers::empty()), vec![0x7f]);
     }
 }
